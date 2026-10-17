@@ -106,11 +106,13 @@ impl Drop for Lease {
     }
 }
 
-pub fn save(path: &Path, body: serde_json::Value) -> Result<()> {
+pub fn save(path: &Path, mut body: serde_json::Value) -> Result<()> {
+    scrub(&mut body);
     let tmp = path.with_extension("pending");
     let result = (|| {
-        rusty::privacy::write_json(&tmp, body)?;
-        File::open(&tmp)?.sync_all()?;
+        let mut writer = std::io::BufWriter::new(rusty::privacy::private_file(&tmp, false)?);
+        serde_json::to_writer(&mut writer, &body)?;
+        writer.into_inner().map_err(|error| error.into_error())?.sync_all()?;
         std::fs::rename(&tmp, path).context("publishing session")?;
         Ok(())
     })();
@@ -118,6 +120,46 @@ pub fn save(path: &Path, body: serde_json::Value) -> Result<()> {
         let _ = std::fs::remove_file(tmp);
     }
     result
+}
+
+/// How many clean history messages `scrub` remembers (32 bytes each).
+const MAX_CLEAN: usize = 1 << 16;
+
+/// `privacy::scrub`, without rescanning history messages it already found
+/// clean. Every save repeats the whole history, almost all of it unchanged
+/// since the last save, and redaction is a pure function of the text for
+/// the life of the process. A message is skipped only when the SHA-256 of
+/// its exact JSON is one that scrubbing left unchanged before.
+fn scrub(body: &mut serde_json::Value) {
+    static CLEAN: std::sync::Mutex<std::collections::BTreeSet<[u8; 32]>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let history = body.get_mut("history").map(serde_json::Value::take);
+    rusty::privacy::scrub(body);
+    let Some(mut history) = history else { return };
+    if let serde_json::Value::Array(items) = &mut history {
+        let mut clean = CLEAN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if clean.len() > MAX_CLEAN {
+            clean.clear();
+        }
+        for item in items {
+            let Ok(raw) = serde_json::to_vec(item) else {
+                rusty::privacy::scrub(item);
+                continue;
+            };
+            let mut digest = [0; 32];
+            digest.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, &raw).as_ref());
+            if clean.contains(&digest) {
+                continue;
+            }
+            rusty::privacy::scrub(item);
+            if serde_json::to_vec(item).is_ok_and(|after| after == raw) {
+                clean.insert(digest);
+            }
+        }
+    } else {
+        rusty::privacy::scrub(&mut history);
+    }
+    body["history"] = history;
 }
 
 /// Publish a parent transcript only once a durable catalog-recovery marker
@@ -724,6 +766,31 @@ mod tests {
         assert!(Lease::acquire(&transcript).is_err());
         drop(writer);
         drop(stale);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repeated_saves_skip_clean_messages_but_always_scrub_secrets() {
+        let dir = temp_dir("scrub-memo");
+        let path = dir.join("memo.json");
+        let clean = serde_json::json!({"role":"tool","content":"fn main() { println!(\"memo-clean\"); }"});
+        let secret = serde_json::json!({"role":"tool","content":"password = MEMO_SECRET_CANARY_41"});
+        let saved = |history: Vec<serde_json::Value>| {
+            save(&path, serde_json::json!({"history":history,"plan":["token = MEMO_PLAN_CANARY_77"]})).unwrap();
+            std::fs::read_to_string(&path).unwrap()
+        };
+        for _ in 0..2 {
+            let text = saved(vec![clean.clone(), secret.clone()]);
+            assert!(text.contains("memo-clean"), "{text}");
+            assert!(!text.contains("MEMO_SECRET_CANARY_41") && !text.contains("MEMO_PLAN_CANARY_77"), "{text}");
+        }
+        // A remembered clean message that changes is scanned again.
+        let mut leaked = clean.clone();
+        leaked["content"] = serde_json::json!("fn main() {}\napi_key = MEMO_CHANGED_CANARY_93");
+        let text = saved(vec![leaked, secret.clone()]);
+        assert!(!text.contains("MEMO_CHANGED_CANARY_93"), "{text}");
+        let saved: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(saved["history"].as_array().unwrap().len(), 2);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
