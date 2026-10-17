@@ -110,8 +110,15 @@ pub fn save(path: &Path, mut body: serde_json::Value) -> Result<()> {
     scrub(&mut body);
     let tmp = path.with_extension("pending");
     let result = (|| {
+        let json = serde_json::to_vec(&body)?;
         let mut writer = std::io::BufWriter::new(rusty::privacy::private_file(&tmp, false)?);
-        serde_json::to_writer(&mut writer, &body)?;
+        if json.len() >= COMPRESS_FROM {
+            let mut gzip = flate2::write::GzEncoder::new(&mut writer, flate2::Compression::new(3));
+            gzip.write_all(&json)?;
+            gzip.finish()?;
+        } else {
+            writer.write_all(&json)?;
+        }
         writer.into_inner().map_err(|error| error.into_error())?.sync_all()?;
         std::fs::rename(&tmp, path).context("publishing session")?;
         Ok(())
@@ -120,6 +127,24 @@ pub fn save(path: &Path, mut body: serde_json::Value) -> Result<()> {
         let _ = std::fs::remove_file(tmp);
     }
     result
+}
+
+/// Transcripts this large are saved gzip-compressed. Tool output makes up
+/// most of a long session and compresses about 3x; small sessions stay
+/// plain JSON. Level 3 costs about 2 ms for 200 KB, close to level 6's size.
+const COMPRESS_FROM: usize = 64 * 1024;
+
+/// A transcript's JSON text, whether it was saved plain or compressed. The
+/// file keeps its `.json` name either way; `gzip -dc` reads a compressed one.
+pub fn read(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let bytes = std::fs::read(path)?;
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut text = String::new();
+        flate2::read::GzDecoder::new(bytes.as_slice()).read_to_string(&mut text)?;
+        return Ok(text);
+    }
+    String::from_utf8(bytes).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 /// How many clean history messages `scrub` remembers (32 bytes each).
@@ -415,7 +440,7 @@ fn recover_pending(db: &mut Connection, dir: &Path) -> Result<()> {
         // read and lose the marker for a newer transcript version.
         let Some(_writer_lease) = Lease::try_acquire(&transcript)? else { continue };
         let recovered = (|| -> Result<Option<(Entry, u64, String)>> {
-            let raw = match std::fs::read_to_string(&transcript) {
+            let raw = match read(&transcript) {
                 Ok(raw) => raw,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(None);
@@ -471,7 +496,7 @@ fn backfill(db: &mut Connection, dir: &Path) -> Result<()> {
             if id.is_empty() || id == "index" || known.contains(&id) {
                 continue;
             }
-            let Ok(value) = std::fs::read_to_string(&path)
+            let Ok(value) = read(&path)
                 .map_err(anyhow::Error::from)
                 .and_then(|source| serde_json::from_str::<serde_json::Value>(&source).map_err(anyhow::Error::from))
             else {
@@ -791,6 +816,37 @@ mod tests {
         assert!(!text.contains("MEMO_CHANGED_CANARY_93"), "{text}");
         let saved: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(saved["history"].as_array().unwrap().len(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn large_transcripts_are_compressed_private_and_load_like_plain_ones() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("compressed");
+        let path = dir.join("large.json");
+        let output = "fn compressed_tool_output() {}\n".repeat(COMPRESS_FROM / 16);
+        let history = vec![
+            serde_json::json!({"role":"user","content":"read the large file"}),
+            serde_json::json!({"role":"tool","content":format!("{output}secret = GZIP_SECRET_CANARY_58")}),
+        ];
+        save(&path, serde_json::json!({"history":history})).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.starts_with(&[0x1f, 0x8b]), "a large transcript is saved compressed");
+        assert!(bytes.len() < output.len() / 4);
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        let text = read(&path).unwrap();
+        assert!(!text.contains("GZIP_SECRET_CANARY_58") && text.contains("compressed_tool_output"));
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["history"].as_array().unwrap().len(), 2);
+        // Catalog discovery and recovery read compressed transcripts too.
+        assert_eq!(search(&dir, "large").unwrap().len(), 1);
+
+        // Plain transcripts, small or written by an older rusty, still load.
+        let plain = dir.join("plain.json");
+        save(&plain, serde_json::json!({"history":[{"role":"user","content":"small plain ask"}]})).unwrap();
+        assert!(std::fs::read_to_string(&plain).unwrap().starts_with('{'));
+        assert!(read(&plain).unwrap().contains("small plain ask"));
+        assert_eq!(search(&dir, "plain").unwrap().len(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

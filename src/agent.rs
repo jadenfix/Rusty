@@ -2820,7 +2820,7 @@ impl Agent {
 
     pub fn load_session(&mut self, path: &std::path::Path) -> Result<()> {
         let lease = crate::session::Lease::acquire(path)?;
-        let raw = std::fs::read_to_string(path)
+        let raw = crate::session::read(path)
             .map_err(|e| anyhow::anyhow!("can't read session file {}: {e}", path.display()))?;
         let v: Value = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("session file {} is damaged and can't be resumed ({e})", path.display()))?;
