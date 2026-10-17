@@ -2813,7 +2813,6 @@ impl Agent {
             return Ok(spoken);
         }
         let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(path.with_extension("lock"));
         Ok(false)
     }
 

@@ -37,29 +37,53 @@ pub fn create(dir: &Path) -> Result<PathBuf> {
     bail!("could not reserve a new session")
 }
 
-pub struct Lease(File);
+/// The one writer of a transcript: an exclusive `flock` on `<id>.lock`.
+/// The lock file exists only while it is held, so a project's session
+/// directory does not collect one empty file per session ever opened.
+pub struct Lease {
+    file: File,
+    path: PathBuf,
+}
 impl Lease {
     pub fn acquire(path: &Path) -> Result<Self> {
         Self::try_acquire(path)?
             .ok_or_else(|| anyhow::anyhow!("session is already open for writing: {}", path.display()))
     }
 
-    fn try_acquire(path: &Path) -> Result<Option<Self>> {
-        let file = rusty::privacy::private_file(&path.with_extension("lock"), true)?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                return Ok(None);
+    fn try_acquire(transcript: &Path) -> Result<Option<Self>> {
+        use std::os::unix::fs::MetadataExt;
+        let path = transcript.with_extension("lock");
+        // A releasing holder unlinks the file before it unlocks. Whoever
+        // then locks that orphaned inode must not count as the writer, or a
+        // third process could lock a fresh file at the same path as well.
+        for _ in 0..64 {
+            let file = rusty::privacy::private_file(&path, true)?;
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    return Ok(None);
+                }
+                return Err(error.into());
             }
-            return Err(error.into());
+            let held = file.metadata()?;
+            match std::fs::symlink_metadata(&path) {
+                Ok(current) if current.dev() == held.dev() && current.ino() == held.ino() => {
+                    return Ok(Some(Self { file, path }));
+                }
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            }
         }
-        Ok(Some(Self(file)))
+        bail!("session lock keeps changing: {}", path.display())
     }
 }
 impl Drop for Lease {
     fn drop(&mut self) {
+        // Unlink while still holding the lock; see `try_acquire`.
+        let _ = std::fs::remove_file(&self.path);
         unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
     }
 }
@@ -639,8 +663,27 @@ mod tests {
         assert!(std::fs::read_to_string(&b).unwrap().contains("second"));
         assert!(Lease::acquire(&a).is_err());
         drop(lease);
+        assert!(!a.with_extension("lock").exists(), "a released lease leaves no lock file behind");
         assert!(Lease::acquire(&a).is_ok());
         assert!(!a.with_extension("pending").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_lock_file_unlinked_by_its_releasing_holder_is_never_shared() {
+        let dir = temp_dir("lease-unlink");
+        let transcript = dir.join("raced.json");
+        let lease = Lease::acquire(&transcript).unwrap();
+        // A second process opened the lock file just before the holder left.
+        let stale = File::open(transcript.with_extension("lock")).unwrap();
+        drop(lease);
+        assert_eq!(unsafe { libc::flock(stale.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        // Locking the orphaned inode grants nothing: the writer is whoever
+        // holds the file at the path, and there is exactly one of those.
+        let writer = Lease::acquire(&transcript).unwrap();
+        assert!(Lease::acquire(&transcript).is_err());
+        drop(writer);
+        drop(stale);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
