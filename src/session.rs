@@ -7,6 +7,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const INDEX: &str = "index.sqlite";
@@ -43,6 +44,11 @@ pub fn create(dir: &Path) -> Result<PathBuf> {
 pub struct Lease {
     file: File,
     path: PathBuf,
+    transcript: PathBuf,
+    /// This writer created the transcript's catalog-recovery marker.
+    marked: AtomicBool,
+    /// The catalog matches the last transcript this writer published.
+    indexed: AtomicBool,
 }
 impl Lease {
     pub fn acquire(path: &Path) -> Result<Self> {
@@ -68,7 +74,13 @@ impl Lease {
             let held = file.metadata()?;
             match std::fs::symlink_metadata(&path) {
                 Ok(current) if current.dev() == held.dev() && current.ino() == held.ino() => {
-                    return Ok(Some(Self { file, path }));
+                    return Ok(Some(Self {
+                        file,
+                        path,
+                        transcript: transcript.to_path_buf(),
+                        marked: AtomicBool::new(false),
+                        indexed: AtomicBool::new(false),
+                    }));
                 }
                 Ok(_) => continue,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -80,6 +92,12 @@ impl Lease {
 }
 impl Drop for Lease {
     fn drop(&mut self) {
+        // An unindexed publish keeps its marker for the next catalog open.
+        if self.marked.load(Ordering::Acquire) && self.indexed.load(Ordering::Acquire) {
+            if let Some(dir) = self.transcript.parent() {
+                let _ = std::fs::remove_file(dir.join(PENDING_DIR).join(id_of(&self.transcript)));
+            }
+        }
         // Unlink while still holding the lock; see `try_acquire`.
         let _ = std::fs::remove_file(&self.path);
         unsafe {
@@ -102,25 +120,28 @@ pub fn save(path: &Path, body: serde_json::Value) -> Result<()> {
     result
 }
 
-/// Publish a parent transcript only after recording a durable catalog-recovery
-/// marker. A crash between transcript rename and SQLite commit can then be
-/// repaired on the next catalog open without scanning the transcript directory.
+/// Publish a parent transcript only once a durable catalog-recovery marker
+/// exists. A crash between transcript rename and SQLite commit can then be
+/// repaired on the next catalog open without scanning the transcript
+/// directory. One marker covers every save the writer makes: recovery skips
+/// it while the lease is held, and the lease clears it on release once the
+/// last save it published is in the catalog.
 pub fn publish_and_record(
     dir: &Path,
-    transcript: &Path,
+    lease: &Lease,
     body: serde_json::Value,
     history: &[serde_json::Value],
     archived: &[serde_json::Value],
 ) -> Result<()> {
-    let marker = pending_marker(dir, transcript)?;
-    save(transcript, body)?;
-    publish_marker(&marker)?;
-    record(dir, transcript, history, archived)?;
-    match std::fs::remove_file(&marker) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("clearing session index recovery marker"),
+    let transcript = lease.transcript.as_path();
+    if !lease.marked.load(Ordering::Acquire) {
+        pending_marker(dir, transcript)?;
+        lease.marked.store(true, Ordering::Release);
     }
+    lease.indexed.store(false, Ordering::Release);
+    save(transcript, body)?;
+    record(dir, transcript, history, archived)?;
+    lease.indexed.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -131,17 +152,6 @@ fn pending_marker(dir: &Path, transcript: &Path) -> Result<PathBuf> {
     file.sync_all()?;
     File::open(dir.join(PENDING_DIR))?.sync_all()?;
     Ok(marker)
-}
-
-fn publish_marker(marker: &Path) -> Result<()> {
-    let mut file = match OpenOptions::new().write(true).truncate(true).open(marker) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    file.write_all(b"published")?;
-    file.sync_all()?;
-    Ok(())
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -808,8 +818,9 @@ mod tests {
         .unwrap();
 
         let current = create(&dir).unwrap();
+        let lease = Lease::acquire(&current).unwrap();
         let history = vec![serde_json::json!({"role":"user","content":"current session ask"})];
-        publish_and_record(&dir, &current, serde_json::json!({"history":history}), &history, &[]).unwrap();
+        publish_and_record(&dir, &lease, serde_json::json!({"history":history}), &history, &[]).unwrap();
         let index = Connection::open(dir.join(INDEX)).unwrap();
         let imported: i64 =
             index.query_row("SELECT count(*) FROM sessions WHERE id='1700000001-42'", [], |row| row.get(0)).unwrap();
@@ -876,6 +887,44 @@ mod tests {
     }
 
     #[test]
+    fn one_marker_covers_a_writers_saves_and_goes_when_it_leaves_indexed() {
+        let dir = temp_dir("writer-marker");
+        let transcript = create(&dir).unwrap();
+        let marker = dir.join(PENDING_DIR).join(id_of(&transcript));
+        let lease = Lease::acquire(&transcript).unwrap();
+        for word in ["first", "second"] {
+            let history = vec![serde_json::json!({"role":"user","content":format!("{word} marker save")})];
+            publish_and_record(&dir, &lease, serde_json::json!({"history":history}), &history, &[]).unwrap();
+            assert!(marker.exists(), "the marker stays while its writer holds the lease");
+        }
+        assert_eq!(search(&dir, "second").unwrap().len(), 1);
+        drop(lease);
+        assert!(!marker.exists(), "a writer whose last save is indexed clears its marker");
+        assert!(!transcript.with_extension("lock").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_writer_that_dies_between_rename_and_commit_is_recovered() {
+        let dir = temp_dir("writer-crash");
+        let transcript = create(&dir).unwrap();
+        let lease = Lease::acquire(&transcript).unwrap();
+        let old = vec![serde_json::json!({"role":"user","content":"old granite phrase"})];
+        publish_and_record(&dir, &lease, serde_json::json!({"history":old}), &old, &[]).unwrap();
+        // The next save renames its transcript and dies before its commit.
+        lease.indexed.store(false, Ordering::Release);
+        let new = vec![serde_json::json!({"role":"user","content":"new basalt phrase"})];
+        save(&transcript, serde_json::json!({"history":new})).unwrap();
+        drop(lease);
+        assert!(dir.join(PENDING_DIR).join(id_of(&transcript)).exists());
+
+        assert_eq!(search(&dir, "basalt").unwrap().len(), 1);
+        assert!(search(&dir, "granite").unwrap().is_empty());
+        assert!(!dir.join(PENDING_DIR).join(id_of(&transcript)).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn recovery_clears_stale_and_side_markers_without_indexing_them() {
         let dir = temp_dir("pending-stale");
         let marker_dir = dir.join(PENDING_DIR);
@@ -925,7 +974,6 @@ mod tests {
 
         let new = vec![serde_json::json!({"role":"user","content":"new crash-recovered phrase"})];
         save(&transcript, serde_json::json!({"history":new})).unwrap();
-        publish_marker(&marker).unwrap();
         let _ = list(&dir).unwrap();
         assert!(marker.exists(), "recovery must also skip an active writer after publication");
         drop(writer); // Crash before record() commits the new catalog row.
@@ -975,8 +1023,7 @@ mod tests {
         upsert(&tx, &entry, newer_ns, Some("newer existing row")).unwrap();
         tx.commit().unwrap();
         drop(index);
-        let marker = pending_marker(&dir, &older).unwrap();
-        publish_marker(&marker).unwrap();
+        pending_marker(&dir, &older).unwrap();
 
         let newest = latest(&dir).unwrap().unwrap();
         assert_eq!(newest.id, id_of(&newer));

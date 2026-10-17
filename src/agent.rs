@@ -2786,7 +2786,9 @@ impl Agent {
         let archived = &self.archived[self.session_from.min(self.archived.len())..];
         if self.side_meta.is_none() && !(self.history.is_empty() && archived.is_empty()) {
             if let Some(dir) = path.parent() {
-                crate::session::publish_and_record(dir, path, body, &self.history, archived)?;
+                let lease =
+                    self.session_lease.as_ref().ok_or_else(|| anyhow::anyhow!("session is not open for writing"))?;
+                crate::session::publish_and_record(dir, lease, body, &self.history, archived)?;
             }
         } else {
             crate::session::save(path, body)?;
