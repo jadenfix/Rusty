@@ -5,8 +5,9 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::Response;
+use serde::Deserialize;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader};
+use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -16,6 +17,7 @@ use crate::anthropic;
 use crate::codex;
 use crate::config::Provider;
 use crate::execution::ExecutionMode;
+use crate::sse::{Field, First, Obj, Str};
 use crate::ui::truncate;
 
 /// How long a request keeps retrying rate limits and server errors before it
@@ -68,14 +70,20 @@ fn refresh_codex_auth(budget: &crate::budget::Budget, refresh: impl FnOnce(Durat
     ensure_request_watched()
 }
 
-/// The lines of a streamed response, with the timer runtime entered while
-/// reqwest's blocking body is polled so its per-read timeout can fire.
-pub fn lines(resp: Response) -> impl Iterator<Item = std::io::Result<String>> {
-    let mut lines = BufReader::new(resp).lines();
-    std::iter::from_fn(move || {
+/// The lines of a streamed response.
+pub fn lines(resp: Response) -> crate::sse::Lines<Body> {
+    crate::sse::Lines::new(Body(resp))
+}
+
+/// A streamed response body, read with the timer runtime entered so
+/// reqwest's per-read timeout can fire.
+pub struct Body(Response);
+
+impl Read for Body {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let _runtime = stream_runtime().enter();
-        lines.next()
-    })
+        self.0.read(buf)
+    }
 }
 
 fn stream_runtime() -> &'static tokio::runtime::Runtime {
@@ -778,6 +786,37 @@ fn openai_inference(body: &mut Value, model: &str, mode: ExecutionMode) {
     }
 }
 
+/// One streamed chat-completions chunk, read in place (see `crate::sse`).
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Chunk<'a> {
+    error: Field,
+    usage: Field,
+    #[serde(borrow)]
+    choices: First<Obj<Choice<'a>>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Choice<'a> {
+    #[serde(borrow)]
+    finish_reason: Str<'a>,
+    #[serde(borrow)]
+    delta: Obj<ChunkDelta<'a>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ChunkDelta<'a> {
+    #[serde(borrow)]
+    reasoning_content: Str<'a>,
+    #[serde(borrow)]
+    reasoning: Str<'a>,
+    #[serde(borrow)]
+    content: Str<'a>,
+    tool_calls: Field,
+}
+
 fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result<Reply> {
     let mut reply = Reply::default();
     let mut calls: Vec<ToolCall> = Vec::new();
@@ -785,11 +824,12 @@ fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result<Rep
     let mut done = false;
     let mut raw = String::new();
 
-    for line in lines(resp) {
+    let mut lines = lines(resp);
+    while let Some(line) = lines.next_line() {
         let line = line.context("stream interrupted")?;
         let Some(data) = line.strip_prefix("data:") else {
             if !saw_data {
-                raw.push_str(&line);
+                raw.push_str(line);
             }
             continue;
         };
@@ -799,26 +839,27 @@ fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result<Rep
             done = true;
             break;
         }
-        let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
-        if let Some(err) = v.get("error") {
+        let mut spare = None;
+        let Some(chunk) = crate::sse::event::<Chunk>(data, &mut spare) else { continue };
+        if let Some(err) = chunk.error.0 {
             bail!("API error: {err}");
         }
-        if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-            reply.usage = usage_of(u);
+        if let Some(u) = chunk.usage.0.filter(|u| !u.is_null()) {
+            reply.usage = usage_of(&u);
         }
-        let Some(choice) = v["choices"].get(0) else { continue };
-        if let Some(fr) = choice["finish_reason"].as_str() {
+        let Some(Obj(choice)) = chunk.choices.0 else { continue };
+        if let Some(fr) = choice.finish_reason.get() {
             reply.finish_reason = Some(fr.to_string());
         }
-        let delta = &choice["delta"];
+        let delta = choice.delta.0;
         // Providers name this field differently; take the first one present.
-        if let Some(s) = ["reasoning_content", "reasoning"].iter().find_map(|k| delta[*k].as_str()) {
+        if let Some(s) = delta.reasoning_content.get().or(delta.reasoning.get()) {
             if !s.is_empty() && !on(Delta::Reasoning(s)) {
                 reply.finish_reason = Some("interrupted".into());
                 break;
             }
         }
-        if let Some(s) = delta["content"].as_str() {
+        if let Some(s) = delta.content.get() {
             if !s.is_empty() {
                 reply.content.push_str(s);
                 if !on(Delta::Content(s)) {
@@ -827,7 +868,7 @@ fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result<Rep
                 }
             }
         }
-        if let Some(tcs) = delta["tool_calls"].as_array() {
+        if let Some(tcs) = delta.tool_calls.0.as_ref().and_then(Value::as_array) {
             for tc in tcs {
                 merge_tool_call(&mut calls, tc);
             }
