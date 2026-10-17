@@ -459,7 +459,11 @@ fn redact_urls(line: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usi
     let mut count = 0;
     let mut rest = line;
     while let Some(i) = rest.find("://") {
-        let scheme_start = rest[..i].rfind(|c: char| !c.is_ascii_alphanumeric() && c != '+').map_or(0, |j| j + 1);
+        // Step past the whole character before the scheme: `é://` is not `\xa9://`.
+        let scheme_start = rest[..i]
+            .char_indices()
+            .rfind(|(_, c)| !c.is_ascii_alphanumeric() && *c != '+')
+            .map_or(0, |(j, c)| j + c.len_utf8());
         let url_end = rest[i..]
             .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
             .map_or(rest.len(), |e| i + e);
@@ -613,6 +617,12 @@ mod tests {
         assert!(!secret_key("PWD") && !secret_key("OLDPWD"));
         assert!(secret_key("DB_PWD") && secret_key("MYSQL_PWD"));
         assert_eq!(redact("PWD=/home/runner/work/app").0, "PWD=/home/runner/work/app");
+    }
+
+    #[test]
+    fn a_url_right_after_a_wide_character_is_still_checked() {
+        assert_eq!(redact("é://x"), ("é://x".to_string(), 0));
+        assert_eq!(redact("✅postgres://app:pa55w0rd@db/x").0, "✅postgres://app:[redacted]@db/x");
     }
 
     #[test]
