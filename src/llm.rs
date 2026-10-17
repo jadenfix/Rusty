@@ -42,13 +42,64 @@ fn stream_idle() -> Duration {
 thread_local! {
     /// Where this thread's request reports a retry wait, when someone is watching.
     static STATUS: std::cell::RefCell<Option<Sender<Event>>> = const { std::cell::RefCell::new(None) };
+    /// Streamed text this thread has parsed but not yet sent (see `Held`).
+    static HELD: std::cell::RefCell<Option<Held>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Tells whoever started this request what it is waiting for; silent otherwise.
 /// False when the one who started it has stopped listening (Ctrl-C, a
 /// budget stop), so a retry nobody will read is not sent.
 fn status(text: String) -> bool {
+    send_held();
     STATUS.with(|s| s.borrow().as_ref().is_none_or(|tx| tx.send(Event::Status(text)).is_ok()))
+}
+
+/// Deltas on their way to the UI thread, joined into one event. A fast
+/// stream parses many deltas from each read, and an event apiece cost an
+/// allocation, a channel message and a wake-up of the UI thread per token.
+/// What is held goes out before the stream next reads from the network, so
+/// text never waits on a slow server: the first token is sent as soon as
+/// its read has been parsed.
+struct Held {
+    tx: Sender<Event>,
+    reasoning: bool,
+    text: String,
+    /// The receiver has gone; the stream should stop.
+    gone: bool,
+}
+
+impl Held {
+    fn push(&mut self, d: Delta) -> bool {
+        let (reasoning, s) = match d {
+            Delta::Reasoning(s) => (true, s),
+            Delta::Content(s) => (false, s),
+        };
+        if reasoning != self.reasoning {
+            self.send();
+            self.reasoning = reasoning;
+        }
+        self.text.push_str(s);
+        !self.gone
+    }
+
+    fn send(&mut self) {
+        if self.text.is_empty() || self.gone {
+            return;
+        }
+        // The next batch is likely the same size; start it with that room.
+        let room = self.text.len();
+        let text = std::mem::replace(&mut self.text, String::with_capacity(room));
+        let ev = if self.reasoning { Event::Reasoning(text) } else { Event::Content(text) };
+        self.gone = self.tx.send(ev).is_err();
+    }
+}
+
+fn send_held() {
+    HELD.with(|h| {
+        if let Some(h) = h.borrow_mut().as_mut() {
+            h.send();
+        }
+    });
 }
 
 fn ensure_request_watched() -> Result<()> {
@@ -81,6 +132,8 @@ pub struct Body(Response);
 
 impl Read for Body {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // Everything parsed so far reaches the UI before this read waits.
+        send_held();
         let _runtime = stream_runtime().enter();
         self.0.read(buf)
     }
@@ -332,13 +385,12 @@ impl Client {
         let me = self.clone();
         std::thread::spawn(move || {
             STATUS.with(|s| *s.borrow_mut() = Some(tx.clone()));
+            let held = Held { tx: tx.clone(), reasoning: false, text: String::new(), gone: false };
+            HELD.with(|h| *h.borrow_mut() = Some(held));
             let result = me.chat(&model, &messages, &tools, temperature, inference, &mut |d| {
-                let ev = match d {
-                    Delta::Reasoning(s) => Event::Reasoning(s.to_string()),
-                    Delta::Content(s) => Event::Content(s.to_string()),
-                };
-                tx.send(ev).is_ok()
+                HELD.with(|h| h.borrow_mut().as_mut().is_none_or(|h| h.push(d)))
             });
+            send_held();
             let _ = tx.send(Event::Done(result));
         });
         rx
@@ -970,6 +1022,32 @@ mod tests {
         ] {
             assert!(!transient_stream_error(e), "{e}");
         }
+    }
+
+    #[test]
+    fn held_deltas_go_out_joined_and_in_order() {
+        let (tx, rx) = channel();
+        let mut held = Held { tx, reasoning: false, text: String::new(), gone: false };
+        for d in [Delta::Reasoning("a"), Delta::Reasoning("b"), Delta::Content("c"), Delta::Content("d")] {
+            assert!(held.push(d));
+        }
+        held.send();
+        assert!(held.push(Delta::Content("e")));
+        held.send();
+        held.send();
+        let got: Vec<String> = rx
+            .try_iter()
+            .map(|e| match e {
+                Event::Reasoning(s) => format!("r:{s}"),
+                Event::Content(s) => format!("c:{s}"),
+                _ => "other".into(),
+            })
+            .collect();
+        assert_eq!(got, ["r:ab", "c:cd", "c:e"]);
+        drop(rx);
+        held.push(Delta::Content("f"));
+        held.send();
+        assert!(!held.push(Delta::Content("g")), "a closed receiver stops the stream");
     }
 
     #[test]
