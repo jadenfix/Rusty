@@ -1,6 +1,19 @@
 //! The redaction code before the single-pass rewrite, kept only to check
 //! that the rewrite gives byte-for-byte the same answers.
-use super::{is_common_type, split_kv, Expect, REDACTED, SECRET_KEYS, SECRET_PREFIXES};
+use super::{handle_name, is_common_type, split_kv, Expect, MIN_RECALL, REDACTED, SECRET_KEYS, SECRET_PREFIXES};
+
+/// The old vault substitution in `redact_with_handles`.
+pub fn recall_known(known: &[String], text: &str) -> (String, usize) {
+    let mut text = text.to_string();
+    let mut count = 0;
+    for (i, value) in known.iter().enumerate() {
+        if value.chars().count() >= MIN_RECALL && text.contains(value.as_str()) {
+            count += text.matches(value.as_str()).count();
+            text = text.replace(value.as_str(), &handle_name(i));
+        }
+    }
+    (text, count)
+}
 
 pub fn redact_by(text: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usize) {
     let mut lines: Vec<String> = Vec::new();

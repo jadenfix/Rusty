@@ -89,17 +89,90 @@ pub fn redact(text: &str) -> (String, usize) {
 /// secret it fetched without ever reading it. Values already handed out are
 /// replaced wherever they show up again, even without a secret-looking key.
 pub fn redact_with_handles(text: &str) -> (String, usize) {
-    let known: Vec<String> = vault().clone();
-    let mut text = text.to_string();
-    let mut count = 0;
-    for (i, value) in known.iter().enumerate() {
-        if value.chars().count() >= MIN_RECALL && text.contains(value.as_str()) {
-            count += text.matches(value.as_str()).count();
-            text = text.replace(value.as_str(), &handle_name(i));
-        }
-    }
+    // The lock is let go before redaction hands out new handles.
+    let (text, count) = recall_known(&vault(), text);
     let (out, n) = redact_by(&text, &mut handle);
     (out, n + count)
+}
+
+/// Puts each handed-out value's handle wherever the value shows up, with
+/// the answer of replacing one value after another in handle order, but in
+/// one scan and one copy. Usually nothing matches and nothing is copied.
+fn recall_known<'a>(known: &[String], text: &'a str) -> (Cow<'a, str>, usize) {
+    let long = |v: &str| v.chars().count() >= MIN_RECALL;
+    // Replacing one value creates another only where that one overlaps the
+    // inserted `${RUSTY_SECRET_n}`, which needs a `$` or `}` or only the
+    // handle's own letters. Such a vault gets each value replaced in turn.
+    let joins_handle = |v: &str| v.contains(['$', '}']) || v.bytes().all(|b| b"RUSTYEC_0123456789".contains(&b));
+    if known.iter().any(|v| long(v) && joins_handle(v)) {
+        let mut text = Cow::Borrowed(text);
+        let mut count = 0;
+        for (i, value) in known.iter().enumerate().filter(|(_, v)| long(v)) {
+            if let Some((replaced, n)) = replace_counted(&text, value, &handle_name(i)) {
+                text = Cow::Owned(replaced);
+                count += n;
+            }
+        }
+        return (text, count);
+    }
+    let mut found = occurrences(known, text, long);
+    if found.is_empty() {
+        return (Cow::Borrowed(text), 0);
+    }
+    // Otherwise a value's matches after the earlier ones were replaced are
+    // its leftmost non-overlapping occurrences in the original text that no
+    // earlier value's match covers: take them in handle order, then position.
+    found.sort_unstable();
+    let mut taken: std::collections::BTreeMap<usize, (usize, usize)> = std::collections::BTreeMap::new();
+    for (value, at) in found {
+        let end = at + known[value].len();
+        if taken.range(..end).next_back().is_some_and(|(_, (e, _))| *e > at) {
+            continue;
+        }
+        taken.insert(at, (end, value));
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    for (at, (end, value)) in &taken {
+        out.push_str(&text[copied..*at]);
+        out.push_str(&handle_name(*value));
+        copied = *end;
+    }
+    out.push_str(&text[copied..]);
+    (Cow::Owned(out), taken.len())
+}
+
+/// Every place one of the `wanted` needles starts in `hay`, as (needle,
+/// position), overlaps included, in one pass: a bitmap of the needles'
+/// first two bytes skips every position none of them starts at.
+fn occurrences(needles: &[String], hay: &str, wanted: impl Fn(&str) -> bool) -> Vec<(usize, usize)> {
+    let pair = |b: &[u8]| usize::from(b[0]) << 8 | usize::from(b[1]);
+    let mut starts: Vec<(usize, usize)> = needles
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.len() >= 2 && wanted(n))
+        .map(|(i, n)| (pair(n.as_bytes()), i))
+        .collect();
+    starts.sort_unstable();
+    let mut bits = vec![0u64; 1 << 10];
+    for (p, _) in &starts {
+        bits[p >> 6] |= 1 << (p & 63);
+    }
+    let mut found = Vec::new();
+    let hay = hay.as_bytes();
+    for i in 0..hay.len().saturating_sub(1) {
+        let p = pair(&hay[i..]);
+        if bits[p >> 6] >> (p & 63) & 1 == 0 {
+            continue;
+        }
+        let from = starts.partition_point(|(q, _)| *q < p);
+        for &(_, j) in starts[from..].iter().take_while(|(q, _)| *q == p) {
+            if hay[i..].starts_with(needles[j].as_bytes()) {
+                found.push((j, i));
+            }
+        }
+    }
+    found
 }
 
 /// `hay` with every `pat` replaced, and how many there were, or `None` when
@@ -595,6 +668,10 @@ mod tests {
         fn pick<'a>(&mut self, xs: &[&'a str]) -> &'a str {
             xs[self.below(xs.len())]
         }
+        fn word(&mut self, alphabet: &str, len: usize) -> String {
+            let chars: Vec<char> = alphabet.chars().collect();
+            (0..len).map(|_| chars[self.below(chars.len())]).collect()
+        }
     }
 
     /// Random text built from the pieces redaction cares about: secret keys,
@@ -730,6 +807,35 @@ mod tests {
             assert_eq!(secret_shape(&text), oracle::secret_shape(&text), "{text:?}");
         }
         assert!(seen > 10_000, "the fuzz text should hold secrets: {seen}");
+    }
+
+    #[test]
+    fn vault_recall_matches_the_old_implementation_on_random_text() {
+        let mut r = Rng(0x9e3779b97f4a7c15);
+        for round in 0..100_000 {
+            // A tiny alphabet makes values overlap, nest and recur; the `$`,
+            // `}` and handle letters exercise the in-order fallback.
+            let alphabet = ["ab", "abc", "ab$}{RUSTY_SECRET_12"][round % 3];
+            let known: Vec<String> = (0..r.below(10))
+                .map(|_| {
+                    let len = 1 + r.below(9);
+                    r.word(alphabet, len)
+                })
+                .collect();
+            let len = r.below(60);
+            let mut text = r.word(alphabet, len);
+            for _ in 0..r.below(4) {
+                if !known.is_empty() {
+                    let at = r.below(known.len());
+                    text.push_str(&known[at]);
+                    text.push_str(&handle_name(r.below(3)));
+                    let len = r.below(5);
+                    text.push_str(&r.word(alphabet, len));
+                }
+            }
+            let (new, n) = recall_known(&known, &text);
+            assert_eq!((new.into_owned(), n), oracle::recall_known(&known, &text), "{known:?} {text:?}");
+        }
     }
 
     #[test]
