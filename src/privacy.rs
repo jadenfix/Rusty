@@ -1,6 +1,8 @@
 //! Shared redaction and private persistence for the CLI and memory service.
 // ------------------------------------------------------------- redaction
 
+use std::borrow::Cow;
+
 /// A key whose value is a secret when it ends with one of these.
 const SECRET_KEYS: &[&str] = &[
     "password",
@@ -59,6 +61,18 @@ const SECRET_PREFIXES: &[&str] = &[
     "eyJ",
 ];
 
+/// The last letters of [`SECRET_KEYS`].
+const KEY_ENDS: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut i = 0;
+    while i < SECRET_KEYS.len() {
+        let key = SECRET_KEYS[i].as_bytes();
+        t[key[key.len() - 1] as usize] = true;
+        i += 1;
+    }
+    t
+};
+
 const REDACTED: &str = "[redacted]";
 
 /// Replaces secrets in tool output with `[redacted]` and counts them.
@@ -86,6 +100,22 @@ pub fn redact_with_handles(text: &str) -> (String, usize) {
     }
     let (out, n) = redact_by(&text, &mut handle);
     (out, n + count)
+}
+
+/// `hay` with every `pat` replaced, and how many there were, or `None` when
+/// there are none. One scan, where `contains`, `matches` and `replace` took three.
+fn replace_counted(hay: &str, pat: &str, with: &str) -> Option<(String, usize)> {
+    let mut matches = hay.match_indices(pat).peekable();
+    matches.peek()?;
+    let (mut out, mut last, mut n) = (String::with_capacity(hay.len()), 0, 0);
+    for (i, _) in matches {
+        out.push_str(&hay[last..i]);
+        out.push_str(with);
+        last = i + pat.len();
+        n += 1;
+    }
+    out.push_str(&hay[last..]);
+    Some((out, n))
 }
 
 /// Redacts one tool's output for the model. A secret store hands back its
@@ -164,7 +194,14 @@ fn handle(value: &str) -> String {
 }
 
 fn redact_by(text: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usize) {
-    let mut lines: Vec<String> = Vec::new();
+    // Lines go straight into one buffer, joined by `\n` as `lines()` split them.
+    let mut out = String::with_capacity(text.len() + text.len() / 8);
+    let mut started = false;
+    let mut next_line = |out: &mut String| {
+        if std::mem::replace(&mut started, true) {
+            out.push('\n');
+        }
+    };
     let mut count = 0;
     let mut in_pem = false;
     let mut in_secret_data = false;
@@ -177,16 +214,18 @@ fn redact_by(text: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usize
         if line.contains("-----BEGIN") && line.contains("PRIVATE KEY") {
             in_pem = true;
             count += 1;
-            lines.push("[redacted private key]".into());
+            next_line(&mut out);
+            out.push_str("[redacted private key]");
             continue;
         }
-        let trimmed = line.trim_start();
         if is_secret_object {
             // Values under `data:` / `stringData:` until the block dedents.
+            let trimmed = line.trim_start();
             let indent = line.len() - trimmed.len();
             if matches!(trimmed.trim_end_matches(" {"), "data:" | "stringData:" | "\"data\":" | "\"stringData\":") {
                 in_secret_data = true;
-                lines.push(line.into());
+                next_line(&mut out);
+                out.push_str(line);
                 continue;
             }
             if in_secret_data && (indent == 0 || trimmed.starts_with('}')) {
@@ -202,16 +241,15 @@ fn redact_by(text: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usize
                     let quoted = v.len() >= 2 && v.starts_with('"') && v.ends_with('"');
                     let v = if quoted { &v[1..v.len() - 1] } else { v };
                     let q = if quoted { "\"" } else { "" };
-                    lines.push(format!("{}{k} {q}{}{q}{tail}", &line[..indent], mark(v)));
+                    next_line(&mut out);
+                    out.push_str(&format!("{}{k} {q}{}{q}{tail}", &line[..indent], mark(v)));
                     continue;
                 }
             }
         }
-        let (redacted, n) = redact_line(line, mark);
-        count += n;
-        lines.push(redacted);
+        next_line(&mut out);
+        count += redact_line(line, mark, &mut out);
     }
-    let mut out = lines.join("\n");
     if text.ends_with('\n') {
         out.push('\n');
     }
@@ -226,9 +264,9 @@ fn redact_by(text: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usize
             })
             .collect()
     }) {
-        if out.contains(secret) {
-            count += out.matches(secret).count();
-            out = out.replace(secret, REDACTED);
+        if let Some((replaced, n)) = replace_counted(&out, secret, REDACTED) {
+            out = replaced;
+            count += n;
         }
     }
     (out, count)
@@ -308,18 +346,19 @@ enum Expect {
     Flag,
 }
 
-fn redact_line(line: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usize) {
+/// Redacts one line onto `out`, returning how many secrets it hid. Scans
+/// bytes: every token character is ASCII, so a token never splits a char.
+fn redact_line(line: &str, mark: &mut dyn FnMut(&str) -> String, out: &mut String) -> usize {
     let (line, mut count) = redact_urls(line, mark);
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line.as_str();
+    let line: &str = &line;
+    let bytes = line.as_bytes();
+    let mut pos = 0;
     let mut expect: Option<Expect> = None;
     let mut key = "";
-    while !rest.is_empty() {
-        let start = rest.find(is_token_char).unwrap_or(rest.len());
-        let (sep, after) = rest.split_at(start);
-        let end = after.find(|c| !is_token_char(c)).unwrap_or(after.len());
-        let (token, after) = after.split_at(end);
-        rest = after;
+    while pos < line.len() {
+        let start = bytes[pos..].iter().position(|&b| TOKEN[usize::from(b)]).map_or(line.len(), |i| pos + i);
+        let end = bytes[start..].iter().position(|&b| !TOKEN[usize::from(b)]).map_or(line.len(), |i| start + i);
+        let (sep, token, rest) = (&line[pos..start], &line[start..end], &line[end..]);
         out.push_str(sep);
         if token.is_empty() {
             break;
@@ -331,20 +370,19 @@ fn redact_line(line: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usi
             Some(Expect::Flag) => is_assignment(sep) || (!sep.is_empty() && sep.trim().is_empty()),
             None => false,
         };
-        let prefix_len = line.len() - rest.len() - token.len() - sep.len();
-        if (wanted && secret_value(token) && !code_expression(key, sep, token, rest, &line[..prefix_len]))
-            || secret_shape(token)
+        if secret_shape(token)
+            || (wanted && secret_value(token) && !code_expression(key, sep, token, rest, &line[..pos]))
         {
             let padded = rest.trim_start_matches('='); // base64 padding
-            let value = &line[line.len() - rest.len() - token.len()..line.len() - padded.len()];
-            out.push_str(&mark(value));
+            pos = line.len() - padded.len();
+            out.push_str(&mark(&line[start..pos]));
             count += 1;
-            rest = padded;
             continue;
         }
         out.push_str(token);
         key = token;
-        expect = if matches!(token.to_ascii_lowercase().as_str(), "bearer" | "basic") {
+        pos = end;
+        expect = if token.eq_ignore_ascii_case("bearer") || token.eq_ignore_ascii_case("basic") {
             Some(Expect::Header)
         } else if secret_key(token) {
             Some(if token.starts_with("--") { Expect::Flag } else { Expect::Key })
@@ -352,7 +390,7 @@ fn redact_line(line: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usi
             None
         };
     }
-    (out, count)
+    count
 }
 
 /// `token = self.token.clone()`, `self.api_key = api_key`, `access_token: String,`:
@@ -360,7 +398,7 @@ fn redact_line(line: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usi
 /// the key's own name again is source code, not a secret. Anything else
 /// counts, including `{password: …}` in a YAML map, `$(mysql --password=…)` and
 /// `password: SecretValue,`: a capitalised word is not proof of a type.
-fn code_expression(key: &str, sep: &str, value: &str, rest: &str, prefix: &str) -> bool {
+fn code_expression<'a>(key: &'a str, sep: &str, value: &'a str, rest: &str, prefix: &str) -> bool {
     if sep.ends_with(['"', '\'']) {
         return false;
     }
@@ -370,14 +408,18 @@ fn code_expression(key: &str, sep: &str, value: &str, rest: &str, prefix: &str) 
     if sep.starts_with(['"', '\'']) && prefix.contains("json!(") {
         return true;
     }
-    let name = |s: &str| s.rsplit('.').next().unwrap_or("").replace(['_', '-'], "").to_ascii_lowercase();
+    // The last path segment, lowercased, without `_` or `-`.
+    let name = |s: &'a str| {
+        let last = s.rsplit('.').next().unwrap_or("");
+        last.bytes().filter(|b| !matches!(b, b'_' | b'-')).map(|b| b.to_ascii_lowercase())
+    };
     let after = rest.trim_start();
     let typed_field = sep.trim_end().ends_with(':')
         && is_common_type(value)
         && (after.is_empty() || after.starts_with([',', ';', ')', '=', '>']));
     rest.starts_with(['(', '[', '<'])
         || rest.starts_with("::")
-        || name(value) == name(key.trim_start_matches('-'))
+        || name(value).eq(name(key.trim_start_matches('-')))
         || typed_field
 }
 
@@ -418,34 +460,54 @@ fn is_common_type(token: &str) -> bool {
     )
 }
 
-fn is_token_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '/' | '@' | '~' | '%')
-}
+/// The bytes a token is made of, all ASCII.
+const TOKEN: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut b = 0;
+    while b < 256 {
+        let c = b as u8;
+        t[b] = c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b'+' | b'/' | b'@' | b'~' | b'%');
+        b += 1;
+    }
+    t
+};
 
 /// `=`, `: `, `": "` and the like, ignoring quotes and spaces. A bare colon
 /// joins a namespaced name (`secret:access`, `token:read`), not a value.
 fn is_assignment(sep: &str) -> bool {
-    let core: String = sep.chars().filter(|c| !c.is_whitespace() && !matches!(c, '"' | '\'')).collect();
-    core == "=" || (core == ":" && sep != ":")
+    let mut core = sep.chars().filter(|c| !c.is_whitespace() && !matches!(c, '"' | '\''));
+    match (core.next(), core.next()) {
+        (Some('='), None) => true,
+        (Some(':'), None) => sep != ":",
+        _ => false,
+    }
 }
 
 fn secret_key(key: &str) -> bool {
-    let k = key.trim_end_matches(|c: char| c.is_ascii_digit() || c == '_').to_ascii_lowercase();
-    // The shell's working-directory variables end in "pwd" but hold paths.
-    if matches!(k.as_str(), "pwd" | "oldpwd") {
+    let k = key.trim_end_matches(|c: char| c.is_ascii_digit() || c == '_').as_bytes();
+    // Most words are rejected on their last letter alone.
+    if !k.last().is_some_and(|b| KEY_ENDS[usize::from(b.to_ascii_lowercase())]) {
         return false;
     }
-    SECRET_KEYS.iter().any(|s| k.ends_with(s))
+    // The shell's working-directory variables end in "pwd" but hold paths.
+    if k.eq_ignore_ascii_case(b"pwd") || k.eq_ignore_ascii_case(b"oldpwd") {
+        return false;
+    }
+    SECRET_KEYS.iter().any(|s| k.len() >= s.len() && k[k.len() - s.len()..].eq_ignore_ascii_case(s.as_bytes()))
 }
 
 /// Short values and placeholders are not secrets. `${VAR}` and `<value>`
 /// never reach here: `$` and `<` are not token characters, so the
 /// assignment check fails on them.
 fn secret_value(v: &str) -> bool {
-    !v.is_empty() && !matches!(v.to_ascii_lowercase().as_str(), "null" | "none" | "true" | "false" | "changeme")
+    !v.is_empty() && !["null", "none", "true", "false", "changeme"].iter().any(|p| v.eq_ignore_ascii_case(p))
 }
 
 fn secret_shape(token: &str) -> bool {
+    // Every shape below needs a prefix and at least twelve more characters.
+    if token.len() < 15 {
+        return false;
+    }
     if token.starts_with("eyJ") {
         // A JWT: three base64url parts.
         return token.split('.').count() == 3 && token.len() > 30;
@@ -454,8 +516,10 @@ fn secret_shape(token: &str) -> bool {
 }
 
 /// `scheme://user:pass@host` anywhere in the line → `scheme://user:[redacted]@host`.
-fn redact_urls(line: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usize) {
-    let mut out = String::with_capacity(line.len());
+fn redact_urls<'a>(line: &'a str, mark: &mut dyn FnMut(&str) -> String) -> (Cow<'a, str>, usize) {
+    // Nothing is copied until a URL actually has a password in it.
+    let mut out = String::new();
+    let mut copied = 0;
     let mut count = 0;
     let mut rest = line;
     while let Some(i) = rest.find("://") {
@@ -467,19 +531,20 @@ fn redact_urls(line: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usi
         let url_end = rest[i..]
             .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
             .map_or(rest.len(), |e| i + e);
-        let url = &rest[scheme_start..url_end];
-        out.push_str(&rest[..scheme_start]);
-        match redact_url(url, mark) {
-            Some(redone) => {
-                out.push_str(&redone);
-                count += 1;
-            }
-            None => out.push_str(url),
+        if let Some(redone) = redact_url(&rest[scheme_start..url_end], mark) {
+            let at = line.len() - rest.len();
+            out.push_str(&line[copied..at + scheme_start]);
+            out.push_str(&redone);
+            copied = at + url_end;
+            count += 1;
         }
         rest = &rest[url_end..];
     }
-    out.push_str(rest);
-    (out, count)
+    if count == 0 {
+        return (Cow::Borrowed(line), 0);
+    }
+    out.push_str(&line[copied..]);
+    (Cow::Owned(out), count)
 }
 
 fn redact_url(url: &str, mark: &mut dyn FnMut(&str) -> String) -> Option<String> {
@@ -512,8 +577,160 @@ pub fn redaction_note(n: usize, handles: bool) -> String {
 }
 
 #[cfg(test)]
+#[path = "privacy_oracle.rs"]
+mod oracle;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+        fn pick<'a>(&mut self, xs: &[&'a str]) -> &'a str {
+            xs[self.below(xs.len())]
+        }
+    }
+
+    /// Random text built from the pieces redaction cares about: secret keys,
+    /// every kind of separator, code, placeholders, URLs, PEM blocks,
+    /// Kubernetes Secrets, CRLF, tabs and non-ASCII.
+    fn fuzz_text(r: &mut Rng) -> String {
+        const PIECES: &[&str] = &[
+            "password",
+            "PASSWORD",
+            "Passwd",
+            "db_pwd",
+            "PWD",
+            "OLDPWD",
+            "token",
+            "TOKEN_2_",
+            "api_key",
+            "apiKey",
+            "API-KEY",
+            "access_token",
+            "client_secret",
+            "--password",
+            "--token",
+            "-p",
+            "Bearer",
+            "BASIC",
+            "bearer",
+            "Authorization:",
+            "key-data",
+            "credentials",
+            "=",
+            "==",
+            ": ",
+            ":",
+            "\": \"",
+            "\":\"",
+            " = ",
+            "='",
+            "\"",
+            "'",
+            " ",
+            "  ",
+            "\t",
+            ",",
+            ";",
+            "(",
+            ")",
+            "[",
+            "]",
+            "<",
+            ">",
+            "{",
+            "}",
+            "::",
+            ".",
+            "$",
+            "${X}",
+            "hunter2",
+            "null",
+            "None",
+            "true",
+            "changeme",
+            "String",
+            "u64",
+            "Vec",
+            "self.token.clone()",
+            "api_key",
+            "x.y",
+            "json!(",
+            "ghp_",
+            "AKIA",
+            "eyJ",
+            "sk-",
+            "SG.",
+            "nvapi-",
+            "xoxb-",
+            "abcdefghijklmnopqrstuvwxyz0123",
+            "ABCDEFGHIJKLMNOP",
+            "aGVsbG8=",
+            "e30.e30.sig",
+            "postgres://",
+            "https://",
+            "u:p@h",
+            "user:pa55@db:5432/x",
+            "@",
+            "/",
+            "%",
+            "~",
+            "+",
+            "_",
+            "-",
+            "\u{2705}",
+            "\u{e9}",
+            "\u{4e2d}",
+            "kind: Secret",
+            "\"kind\": \"Secret\"",
+            "data:",
+            "stringData: {",
+            "\"data\":",
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----END RSA PRIVATE KEY-----",
+            "-----BEGIN",
+            "PRIVATE KEY",
+            "\n",
+            "\n",
+            "\n  ",
+            "\r\n",
+            "\n}",
+            "0",
+            "42",
+            "hello",
+            "world",
+        ];
+        let n = r.below(40);
+        let mut s: String = (0..n).map(|_| r.pick(PIECES)).collect();
+        if r.below(3) == 0 {
+            s.push('\n');
+        }
+        s
+    }
+
+    #[test]
+    fn redaction_matches_the_old_implementation_on_random_text() {
+        let mut r = Rng(0x2545f4914f6cdd1d);
+        let mut seen = 0;
+        for _ in 0..200_000 {
+            let text = fuzz_text(&mut r);
+            let mut mark = |v: &str| format!("<{v}>");
+            let new = redact_by(&text, &mut mark);
+            assert_eq!(new, oracle::redact_by(&text, &mut mark), "{text:?}");
+            seen += new.1;
+            let token = text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-').next().unwrap_or("");
+            assert_eq!(secret_key(token), oracle::secret_key(token), "{token:?}");
+            assert_eq!(secret_shape(&text), oracle::secret_shape(&text), "{text:?}");
+        }
+        assert!(seen > 10_000, "the fuzz text should hold secrets: {seen}");
+    }
 
     #[test]
     fn handles_name_each_secret_and_hand_it_to_shells() {
