@@ -403,10 +403,13 @@ fn cache_usage(u: &Value) -> (u64, u64) {
     (n("cache_read_input_tokens"), n("cache_creation_input_tokens"))
 }
 
+/// Grows the block's text in place. Copying it out and back on every delta
+/// made a long answer quadratic: minutes and gigabytes for a few megabytes.
 fn append(block: &mut Value, key: &str, s: &str) {
-    let mut cur = block[key].as_str().unwrap_or("").to_string();
-    cur.push_str(s);
-    block[key] = json!(cur);
+    match &mut block[key] {
+        Value::String(cur) => cur.push_str(s),
+        other => *other = Value::String(s.to_owned()),
+    }
 }
 
 fn finish(
@@ -615,6 +618,17 @@ mod tests {
         let types: Vec<&str> = raw.as_array().unwrap().iter().map(|b| b["type"].as_str().unwrap()).collect();
         assert_eq!(types, vec!["text", "text"]);
         assert_eq!(reply.content, "Partial answer. Rest.");
+    }
+
+    #[test]
+    fn deltas_grow_a_block_in_place() {
+        let mut block = json!({"type": "text", "text": "a"});
+        append(&mut block, "text", "b");
+        append(&mut block, "signature", "s");
+        assert_eq!(block, json!({"type": "text", "text": "ab", "signature": "s"}));
+        let mut odd = json!({"type": "text", "text": 7});
+        append(&mut odd, "text", "c");
+        assert_eq!(odd["text"], "c", "a non-string is replaced, as before");
     }
 
     #[test]
