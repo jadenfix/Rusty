@@ -16,7 +16,7 @@ const MAX_TEXT_CHARS: usize = 4000;
 const MAX_TITLE_CHARS: usize = 60;
 const MAX_MATCHES: usize = 20;
 const MAX_LIST: usize = 50;
-const INDEX_VERSION: i64 = 2;
+const INDEX_VERSION: i64 = 3;
 
 pub fn create(dir: &Path) -> Result<PathBuf> {
     rusty::privacy::private_dir(dir)?;
@@ -247,30 +247,58 @@ fn remove_index_files(dir: &Path) {
     }
 }
 
+/// One row per parent session, plus a contentless full-text index of its
+/// terms. Only the index of the terms is kept, never their text: the text
+/// is rebuilt from the transcript whenever it changes. The explicit integer
+/// key is what the full-text rows point at, so VACUUM cannot renumber it.
+const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS sessions(
+       n INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, title TEXT NOT NULL, started INTEGER NOT NULL,
+       updated INTEGER NOT NULL, updated_ns INTEGER NOT NULL, messages INTEGER NOT NULL
+     );
+     CREATE INDEX IF NOT EXISTS sessions_updated ON sessions(updated_ns DESC, id DESC);
+     CREATE VIRTUAL TABLE IF NOT EXISTS session_terms
+       USING fts5(terms, content='', contentless_delete=1, tokenize='unicode61');";
+
 fn fresh_connection(dir: &Path) -> Result<Connection> {
     let path = dir.join(INDEX);
     drop(rusty::privacy::private_file(&path, true)?);
     let db = Connection::open(&path)?;
     db.busy_timeout(std::time::Duration::from_secs(5))?;
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version != 0 && version != INDEX_VERSION {
+    if version != 0 && version != 2 && version != INDEX_VERSION {
         bail!("unsupported session index version {version}");
     }
-    db.execute_batch(
-        "PRAGMA journal_mode=DELETE;
-         PRAGMA synchronous=FULL;
-         CREATE TABLE IF NOT EXISTS sessions(
-           id TEXT PRIMARY KEY, title TEXT NOT NULL, started INTEGER NOT NULL,
-           updated INTEGER NOT NULL, updated_ns INTEGER NOT NULL, messages INTEGER NOT NULL,
-           text TEXT NOT NULL, terms TEXT NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS sessions_updated ON sessions(updated_ns DESC, id DESC);
-         CREATE VIRTUAL TABLE IF NOT EXISTS session_terms USING fts5(id UNINDEXED, terms, tokenize='unicode61');
-         PRAGMA user_version=2;",
-    )?;
-    db.prepare("SELECT id,title,started,updated,updated_ns,messages,text,terms FROM sessions LIMIT 0")?;
-    db.prepare("SELECT id,terms FROM session_terms LIMIT 0")?;
+    db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")?;
+    if version == 2 {
+        migrate_v2(&db)?;
+    }
+    db.execute_batch(SCHEMA)?;
+    db.pragma_update(None, "user_version", INDEX_VERSION)?;
+    db.prepare("SELECT n,id,title,started,updated,updated_ns,messages FROM sessions LIMIT 0")?;
+    db.prepare("SELECT rowid FROM session_terms LIMIT 0")?;
     Ok(db)
+}
+
+/// Version 2 stored each session's recent text and its terms in the row and
+/// a third copy inside the full-text table. Keep every row (a rebuild from
+/// the transcripts would lose titles a compaction has since dropped from the
+/// history) and its indexed terms, then hand the freed pages back.
+fn migrate_v2(db: &Connection) -> Result<()> {
+    db.execute_batch(&format!(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE sessions RENAME TO sessions_v2;
+         DROP INDEX IF EXISTS sessions_updated;
+         DROP TABLE session_terms;
+         {SCHEMA}
+         INSERT INTO sessions(n,id,title,started,updated,updated_ns,messages)
+           SELECT rowid,id,title,started,updated,updated_ns,messages FROM sessions_v2;
+         INSERT INTO session_terms(rowid,terms) SELECT rowid,terms FROM sessions_v2;
+         DROP TABLE sessions_v2;
+         PRAGMA user_version={INDEX_VERSION};
+         COMMIT;
+         VACUUM;"
+    ))
+    .context("upgrading the session index")
 }
 
 fn index_ready(dir: &Path, discover_unindexed: bool) -> Result<SessionIndex> {
@@ -364,7 +392,7 @@ fn recover_pending(db: &mut Connection, dir: &Path) -> Result<()> {
         })()?;
         if let Some((entry, updated_ns, text)) = recovered {
             let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            upsert(&tx, &entry, updated_ns, &text)?;
+            upsert(&tx, &entry, updated_ns, Some(&text))?;
             tx.commit()?;
         }
         // The writer lease guarantees no concurrent publisher can need this
@@ -425,23 +453,28 @@ fn backfill(db: &mut Connection, dir: &Path) -> Result<()> {
     }
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for (entry, updated_ns, text) in rows {
-        upsert(&tx, &entry, updated_ns, &text)?;
+        upsert(&tx, &entry, updated_ns, Some(&text))?;
     }
     tx.commit()?;
     Ok(())
 }
 
-fn upsert(tx: &rusqlite::Transaction<'_>, entry: &Entry, updated_ns: u64, text: &str) -> Result<()> {
-    let terms = rusty::recall::terms(&format!("{}\n{text}", entry.title)).join(" ");
-    tx.execute(
-        "INSERT INTO sessions(id,title,started,updated,updated_ns,messages,text,terms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+/// Writes a session's row. `text` is what its terms come from; `None` keeps
+/// the terms already indexed, for a history with nothing new to say.
+fn upsert(tx: &rusqlite::Transaction<'_>, entry: &Entry, updated_ns: u64, text: Option<&str>) -> Result<()> {
+    let n: i64 = tx.query_row(
+        "INSERT INTO sessions(id,title,started,updated,updated_ns,messages) VALUES(?1,?2,?3,?4,?5,?6)
          ON CONFLICT(id) DO UPDATE SET title=excluded.title,started=excluded.started,
-           updated=excluded.updated,updated_ns=excluded.updated_ns,messages=excluded.messages,text=excluded.text,terms=excluded.terms",
-        params![entry.id, entry.title, entry.started, entry.updated, updated_ns, entry.messages, text, terms],
+           updated=excluded.updated,updated_ns=excluded.updated_ns,messages=excluded.messages
+         RETURNING n",
+        params![entry.id, entry.title, entry.started, entry.updated, updated_ns, entry.messages],
+        |row| row.get(0),
     )?;
-    let rowid: i64 = tx.query_row("SELECT rowid FROM sessions WHERE id=?1", [&entry.id], |row| row.get(0))?;
-    tx.execute("DELETE FROM session_terms WHERE rowid=?1", [rowid])?;
-    tx.execute("INSERT INTO session_terms(rowid,id,terms) VALUES(?1,?2,?3)", params![rowid, entry.id, terms])?;
+    if let Some(text) = text {
+        let terms = rusty::recall::terms(&format!("{}\n{text}", entry.title)).join(" ");
+        tx.execute("DELETE FROM session_terms WHERE rowid=?1", [n])?;
+        tx.execute("INSERT INTO session_terms(rowid,terms) VALUES(?1,?2)", params![n, terms])?;
+    }
     Ok(())
 }
 
@@ -472,23 +505,20 @@ pub fn record(
     // still retain the order in which saves were committed.
     let updated_ns = now_ns.max((last_updated_ns.max(0) as u64).saturating_add(1));
     let now = updated_ns / 1_000_000_000;
-    let previous: Option<(u64, String, String)> = tx
-        .query_row("SELECT started,title,text FROM sessions WHERE id=?1", [&id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
+    let previous: Option<(u64, String)> = tx
+        .query_row("SELECT started,title FROM sessions WHERE id=?1", [&id], |row| Ok((row.get(0)?, row.get(1)?)))
         .optional()?;
     // The title is the session's first ask. A compacted or resumed history
-    // no longer starts with it, so the first title recorded stays.
+    // no longer starts with it, so the first title recorded stays. A history
+    // with nothing said in it keeps the terms already indexed.
     let (started, title, text) = match previous {
-        Some((started, old_title, old_text)) => (
-            started,
-            if old_title.is_empty() { title } else { old_title },
-            if text.is_empty() { old_text } else { text },
-        ),
-        None => (now, title, text),
+        Some((started, old_title)) => {
+            (started, if old_title.is_empty() { title } else { old_title }, Some(text).filter(|text| !text.is_empty()))
+        }
+        None => (now, title, Some(text)),
     };
     let entry = Entry { id, title, started, updated: now, messages: archived.len() + history.len() };
-    upsert(&tx, &entry, updated_ns, &text)?;
+    upsert(&tx, &entry, updated_ns, text.as_deref())?;
     tx.commit()?;
     Ok(())
 }
@@ -556,7 +586,7 @@ pub fn search(dir: &Path, query: &str) -> Result<Vec<Entry>> {
     with_index(dir, |db| {
         let mut stmt = db.prepare(
             "SELECT s.id,s.title,s.started,s.updated,s.messages
-             FROM session_terms f JOIN sessions s ON s.rowid=f.rowid
+             FROM session_terms f JOIN sessions s ON s.n=f.rowid
              WHERE session_terms MATCH ?1 ORDER BY bm25(session_terms) LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![expression, MAX_MATCHES], row_entry)?;
@@ -942,7 +972,7 @@ mod tests {
             updated: newer_ns / 1_000_000_000,
             messages: 1,
         };
-        upsert(&tx, &entry, newer_ns, "newer existing row").unwrap();
+        upsert(&tx, &entry, newer_ns, Some("newer existing row")).unwrap();
         tx.commit().unwrap();
         drop(index);
         let marker = pending_marker(&dir, &older).unwrap();
@@ -956,6 +986,62 @@ mod tests {
             .query_row("SELECT updated_ns FROM sessions WHERE id='older-pending'", [], |row| row.get(0))
             .unwrap();
         assert_eq!(older_indexed_ns, older_ns, "recovery preserves the transcript's actual mtime");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_version_2_index_upgrades_in_place_and_keeps_its_rows() {
+        let dir = temp_dir("index-v2");
+        // A transcript whose history no longer opens with the title the
+        // catalog kept: a rebuild from files would lose that title.
+        let kept = dir.join("kept.json");
+        rusty::privacy::write_json(&kept, serde_json::json!({"history":[{"role":"user","content":"later ask"}]}))
+            .unwrap();
+        let db = Connection::open(dir.join(INDEX)).unwrap();
+        db.execute_batch(
+            "CREATE TABLE sessions(
+               id TEXT PRIMARY KEY, title TEXT NOT NULL, started INTEGER NOT NULL,
+               updated INTEGER NOT NULL, updated_ns INTEGER NOT NULL, messages INTEGER NOT NULL,
+               text TEXT NOT NULL, terms TEXT NOT NULL
+             );
+             CREATE INDEX sessions_updated ON sessions(updated_ns DESC, id DESC);
+             CREATE VIRTUAL TABLE session_terms USING fts5(id UNINDEXED, terms, tokenize='unicode61');
+             INSERT INTO sessions VALUES('kept','fix the zebra bug',5,6,6000000000,3,'fix the zebra bug','fix zebra bug');
+             INSERT INTO session_terms(rowid,id,terms) SELECT rowid,id,terms FROM sessions;
+             PRAGMA user_version=2;",
+        )
+        .unwrap();
+        drop(db);
+
+        let listed = list(&dir).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            (listed[0].title.as_str(), listed[0].started, listed[0].updated, listed[0].messages),
+            ("fix the zebra bug", 5, 6, 3)
+        );
+        assert_eq!(search(&dir, "zebra").unwrap().len(), 1, "terms indexed by version 2 stay searchable");
+        let db = Connection::open(dir.join(INDEX)).unwrap();
+        let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, INDEX_VERSION);
+        assert!(db.prepare("SELECT text FROM sessions").is_err(), "the duplicated text column is gone");
+        drop(db);
+
+        // Later saves of the upgraded row replace its terms.
+        let history = vec![serde_json::json!({"role":"user","content":"now about the yak"})];
+        record(&dir, &kept, &history, &[]).unwrap();
+        assert!(search(&dir, "zebra").unwrap().len() == 1, "the kept title is still indexed");
+        assert_eq!(search(&dir, "yak").unwrap().len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_save_with_nothing_said_keeps_the_indexed_terms() {
+        let dir = temp_dir("terms-kept");
+        let path = create(&dir).unwrap();
+        record(&dir, &path, &[serde_json::json!({"role":"user","content":"tune the walrus cache"})], &[]).unwrap();
+        // A compacted history can hold only notes and replies.
+        record(&dir, &path, &[serde_json::json!({"role":"assistant","content":"done"})], &[]).unwrap();
+        assert_eq!(search(&dir, "walrus").unwrap().len(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1017,7 +1103,7 @@ mod tests {
             rusty::privacy::write_json(&dir.join(format!("{id}.json")), serde_json::json!({})).unwrap();
             let text = if n == 4_999 { "needle_unique_token searchable catalog" } else { "ordinary catalog entry" };
             let entry = Entry { id, title: text.to_owned(), started: 1, updated: n, messages: 2 };
-            upsert(&tx, &entry, n * 1_000_000_000, text).unwrap();
+            upsert(&tx, &entry, n * 1_000_000_000, Some(text)).unwrap();
         }
         tx.commit().unwrap();
         drop(index);
@@ -1051,7 +1137,7 @@ mod tests {
         for (id, updated_ns) in [("older", 1_800_000_000_100_000_000), ("newer", 1_800_000_000_900_000_000)] {
             rusty::privacy::write_json(&dir.join(format!("{id}.json")), serde_json::json!({})).unwrap();
             let entry = Entry { id: id.into(), title: id.into(), started: 10, updated: 1_800_000_000, messages: 2 };
-            upsert(&tx, &entry, updated_ns, id).unwrap();
+            upsert(&tx, &entry, updated_ns, Some(id)).unwrap();
         }
         tx.commit().unwrap();
         drop(index);
@@ -1070,7 +1156,7 @@ mod tests {
         for (n, id) in ["aa11", "aa22", "bb33"].into_iter().enumerate() {
             rusty::privacy::write_json(&dir.join(format!("{id}.json")), serde_json::json!({})).unwrap();
             let entry = Entry { id: id.into(), title: id.into(), started: 1, updated: 1, messages: 2 };
-            upsert(&tx, &entry, n as u64, id).unwrap();
+            upsert(&tx, &entry, n as u64, Some(id)).unwrap();
         }
         tx.commit().unwrap();
         drop(index);
@@ -1091,7 +1177,7 @@ mod tests {
         for (id, messages, ns) in [("spoken", 2, 1_000), ("silent", 0, 2_000)] {
             rusty::privacy::write_json(&dir.join(format!("{id}.json")), serde_json::json!({})).unwrap();
             let entry = Entry { id: id.into(), title: String::new(), started: 1, updated: 1, messages };
-            upsert(&tx, &entry, ns, "").unwrap();
+            upsert(&tx, &entry, ns, Some("")).unwrap();
         }
         tx.commit().unwrap();
         drop(index);
@@ -1113,14 +1199,12 @@ mod tests {
         record(&dir, &path, &history, &[]).unwrap();
 
         let index = Connection::open(dir.join(INDEX)).unwrap();
-        let (title, text, terms): (String, String, String) = index
-            .query_row("SELECT title,text,terms FROM sessions WHERE id=?1", [&id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .unwrap();
+        let title: String = index.query_row("SELECT title FROM sessions WHERE id=?1", [&id], |row| row.get(0)).unwrap();
+        // The indexed terms come from this redacted text.
+        let text = text_for(&[], &history);
         assert!(text.contains("let token = self.token.clone();"), "{text}");
         assert!(text.contains("password=[redacted]"), "{text}");
-        assert!(!title.contains(secret) && !text.contains(secret) && !terms.contains(secret));
+        assert!(!title.contains(secret) && !text.contains(secret));
         assert!(search(&dir, secret).unwrap().is_empty());
         assert!(search(&dir, "self.token.clone").unwrap().iter().any(|entry| entry.id == id));
         assert!(!render(&list(&dir).unwrap(), rusty::unix_now()).contains(secret));
