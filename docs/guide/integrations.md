@@ -75,6 +75,16 @@ its success can coexist with an optional failure. Direct HTTP transport, OAuth,
 resources and prompts are not implied by this stdio tools client. An explicitly
 configured stdio bridge can provide its own connection behavior.
 
+MCP requests have bounded frames and deadlines; notifications do not keep a
+request alive forever. A lost connection after sending a tool call can leave
+its effects unknown. Inspect the external system before retrying an action.
+Trajectory records distinguish `not_started`, `settled` (a matching response,
+including an invalid body) and `unknown` (sent without a matching response).
+`settled` therefore does not mean the tool succeeded. These private outcome tags
+are omitted from provider messages, and totals appear in `mcp_outcomes` in an
+export. They are observations, not a durable recovery protocol. See
+[verification and resource limits](../VERIFICATION.md) for the exact bounds.
+
 Check: status names the intended remote, an explicit access check succeeds when
 needed, and a server's tools are actually available after restarting the session.
 Keep model response proof, host access proof and MCP health proof separate.

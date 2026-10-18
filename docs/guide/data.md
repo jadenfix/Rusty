@@ -19,6 +19,13 @@ user messages and sensitive non-key data can remain. Inspect captures, manifests
 trajectories and archives before sharing. Store credentials in their designated
 files/environment rather than prompt text.
 
+Saved transcripts keep their `.json` filename when compressed. Rusty saves JSON
+of at least 64 KiB as gzip and reads both formats when resuming. A large saved
+conversation shows binary data with `cat`; JSON tools such as `jq` cannot parse
+it directly. Use Rusty’s session list and resume commands; inspect the type before a
+JSON tool, and decompress only a copy when needed. Compression saves storage;
+loading still materializes the transcript in memory.
+
 `--memory off` disables memory for the run; it does not erase prior lessons or
 stop a separately running shared memory service. `/clear` keeps memories.
 `/forget <id>` removes a lesson, not the conversation that mentioned it.

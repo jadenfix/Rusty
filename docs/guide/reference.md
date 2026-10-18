@@ -43,7 +43,7 @@ silence drift by changing expected values without checking user-visible behavior
 | Delegation | `off`, `sub`, `swarm`, `auto` |
 | Memory | `off`, `recall`, `learn`, `reflect`, `deep` |
 | Compaction | `aggressive`, `standard`, `passive`, `smart` |
-| Tool location | `local`, `daytona` |
+| Tool location | `local`, `daytona`, `ssh` |
 | Toolset | `full`, `shell` |
 | View | `default`, `verbose`, `adhd` |
 | Theme | `rust`, `neon`, `matrix`, `amber`, `ice`, `mono`, `paper` |

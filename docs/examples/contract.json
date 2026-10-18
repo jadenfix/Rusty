@@ -1,6 +1,6 @@
 {
   "capabilities": {
-    "contract": 2,
+    "contract": 4,
     "memory": [
       "off",
       "recall",
@@ -34,7 +34,8 @@
     ],
     "tools": [
       "local",
-      "daytona"
+      "daytona",
+      "ssh"
     ],
     "toolset": [
       "full",
@@ -57,7 +58,8 @@
       "timeout_secs": [
         1,
         600
-      ]
+      ],
+      "files_flag": true
     },
     "mcp": {
       "transports": [
@@ -80,6 +82,7 @@
       "safety",
       "goal",
       "goal_end",
+      "goal_outcome",
       "context",
       "compactions"
     ],
@@ -117,6 +120,7 @@
     "--continue",
     "--goal",
     "--verify",
+    "--verify-file",
     "--verify-timeout",
     "--doctor",
     "--list-models",

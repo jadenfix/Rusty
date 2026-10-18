@@ -117,11 +117,28 @@ fn resume_walkthrough_keeps_context_without_replaying_and_new_starts_fresh() {
     let seen = requests.clone();
     let server = support::serve(Arc::new(move |request| {
         seen.lock().unwrap().push(request.json());
-        support::reply(0, None, "DOCUMENTED_REPLY")
+        support::reply(0, None, &("DOCUMENTED_REPLY".to_owned() + &"x".repeat(128 * 1024)))
     }));
     let endpoint = format!("{}/v1", server.url);
     trial.run(&["--mode", "standard", "DOCUMENTED_FIRST"], None, Some(&endpoint));
     assert_eq!(requests.lock().unwrap().len(), 1);
+    // Session filenames remain .json even when the on-disk content is gzip.
+    fn compressed_transcripts(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    compressed_transcripts(&path)
+                } else if path.extension().is_some_and(|ext| ext == "json") {
+                    usize::from(std::fs::read(path).unwrap().starts_with(&[0x1f, 0x8b]))
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+    assert_eq!(compressed_transcripts(&trial.root.path().join("home")), 1);
     let resumed = trial.run(&["-c"], None, Some(&endpoint));
     let resumed = String::from_utf8_lossy(&resumed.stdout);
     assert!(resumed.contains("DOCUMENTED_FIRST") && resumed.contains("DOCUMENTED_REPLY"), "{resumed}");

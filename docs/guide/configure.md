@@ -48,7 +48,7 @@ check, send one small prompt and verify a response under the intended provider.
 |---|---|---|
 | Theme, font, view, tips | `/theme`, `/font`, `/view`, `/tips` | Rusty preferences, saved for later launches |
 | Execution/delegation defaults | `/mode`, `/agents`, `/swarm` | Saved preferences; explicit flags/environment can override |
-| Tool location | `/tools local` or `/tools daytona` | Saved default; Daytona requires setup |
+| Tool location | `/tools local`, `/tools daytona`, `/tools ssh` | Saved default for the next session; remote choices require their bridge launcher |
 | Current model | `/model <id>` or `--model` | Current session; inspect again after restarting |
 | Permissions | `/permissions <mode>` or `--permissions` | Current policy; do not infer persistence from `/settings` |
 | Codex default model | `/codex model <id>` | Shared Codex config, also applied here when routed to Codex |
