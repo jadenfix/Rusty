@@ -9,7 +9,9 @@ The checked [documentation contract](../examples/contract.json) records the
 capability contract, documented flags/commands and one configuration walkthrough.
 `tests/documentation.rs` compares it with the actual built binary, verifies
 keyless integration setup and project-specific remote persistence, preference persistence across processes, and checks no-request resume, follow-up
-context and fresh-session isolation using a local provider. These are executable
+context and fresh-session isolation using a local provider. It forces compressed
+transcript storage and verifies direct shell execution through a shell-created
+file while observing zero inference requests. These are executable
 examples, not a substitute for native UI or real-authentication checks.
 
 ```sh

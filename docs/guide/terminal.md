@@ -21,6 +21,13 @@ capture. Narrow headers can clip supplementary metadata; use `/settings`,
 while output is streaming, then confirm the draft remains visible and editable.
 A blank/stale completion region is a UI defect, not evidence work is still running.
 
+Terminal prose wraps at word boundaries, with list and quote continuation
+aligned to their marker. Code blocks, table rows and very long paths or URLs
+retain their own content and may still hard-wrap in a narrow pane. `NO_COLOR`
+changes styling while terminal prose still wraps; redirected output keeps its
+original text. Inspect narrow layouts with the actual terminal, especially when
+copying a command or path from scrollback.
+
 ## Input and menus
 
 At idle, type `/` to open completion. Type more to filter, use Up/Down to select,
