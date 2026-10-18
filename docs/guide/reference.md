@@ -29,7 +29,9 @@ python3 scripts/check-docs.py --base origin/main
 A source change touching a mapped area must update its guide in the same PR,
 including relevant example/evidence changes. This is a review reminder, not proof
 that the prose is accurate. When behavior intentionally stays the same, add a
-short evidence note to the relevant guide explaining what was checked. Do not
+short evidence note to each affected guide and mapped deep reference explaining
+the invariant and concrete check. This deliberately keeps review context with the
+contract; a whitespace-only edit is not useful evidence. Do not
 silence drift by changing expected values without checking user-visible behavior.
 
 ## Accepted settings
@@ -58,10 +60,10 @@ list here guarantees a model or remote tool is available to your account.
 | Cargo/package/distribution | [Install](install.md) |
 | Provider/auth/config/doctor | [Configure](configure.md) |
 | Theme/editor/footer/completion/signal/display/markdown | [Terminal](terminal.md) |
-| Agent/tools/permissions/execution/verification/budget | [Work](work.md) |
+| Agent/tools/workspace queries/permissions/execution/verification/budget | [Work](work.md) |
 | Repository hosts, remotes and MCP | [Integrations](integrations.md) and the [deep guide](../INTEGRATIONS.md) |
 | Session/backend/main lifecycle | [Sessions](sessions.md) |
-| Advisor/memory/privacy/context/storage | [Data](data.md) |
+| Archive/advisor/memory/privacy/context/storage | [Data](data.md) |
 | Cloud, memory service, verification, infrastructure | Their linked deep references as well as the journey guide |
 
 After a UI audit, rerun relevant demos on the frozen candidate and record source,

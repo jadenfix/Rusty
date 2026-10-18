@@ -23,7 +23,9 @@
 - User-visible changes must update the affected [lifecycle guide](docs/guide/README.md)
   and its examples/tests in the same PR. Follow the source-area map in
   [reference](docs/guide/reference.md); explain verified unchanged behavior when
-  an implementation change does not alter the user contract.
+  an implementation change does not alter the user contract. The same rule applies
+  to mapped deep references: record the concrete invariant and check rather than
+  claiming behavior changed. The coverage check deliberately has no refactor bypass.
 - Run `python3 scripts/check-docs.py --base origin/main`, its `--self-test`, and
   `cargo test --locked --test documentation`. These checks are part of CI;
   `cargo xtask qa` remains required before pushing.

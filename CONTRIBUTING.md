@@ -82,7 +82,9 @@ Use the [ordered user guide](docs/guide/README.md) and its
 [source-area map](docs/guide/reference.md) when changing user-facing behavior.
 Update the relevant section plus executable examples/contracts in the same PR.
 A refactor with no behavior change should leave a short check/evidence note in
-that section instead of inventing a user-visible change. `AGENTS.md` is the
+that section and any mapped deep reference instead of inventing a user-visible
+change. Name the invariant and actual check; do not make a whitespace-only edit
+to satisfy the coverage guard. `AGENTS.md` is the
 shared repository instruction; there is no second duplicated policy to drift.
 
 Run `python3 scripts/check-docs.py --base origin/main`,
