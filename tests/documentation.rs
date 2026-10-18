@@ -111,6 +111,23 @@ fn configuration_walkthrough_persists_preferences_but_not_session_policy() {
 }
 
 #[test]
+fn direct_command_walkthrough_uses_the_project_without_a_model_request() {
+    let trial = Trial::new();
+    let requests = Arc::new(Mutex::new(0usize));
+    let seen = requests.clone();
+    let server = support::serve(Arc::new(move |_| {
+        *seen.lock().unwrap() += 1;
+        support::reply(0, None, "unexpected model request")
+    }));
+    let endpoint = format!("{}/v1", server.url);
+    let output = trial.run(&[], Some("!pwd\n/exit\n"), Some(&endpoint));
+    let text = String::from_utf8_lossy(&output.stdout);
+    let expected = std::fs::canonicalize(&trial.project).unwrap();
+    assert!(text.contains(expected.to_str().unwrap()), "{text}");
+    assert_eq!(*requests.lock().unwrap(), 0, "the documented direct command must not ask a model");
+}
+
+#[test]
 fn resume_walkthrough_keeps_context_without_replaying_and_new_starts_fresh() {
     let trial = Trial::new();
     let requests = Arc::new(Mutex::new(Vec::<Value>::new()));

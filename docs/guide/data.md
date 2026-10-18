@@ -52,6 +52,16 @@ preparation now spools its largest build context to a private unlinked temporary
 file: allow temporary disk space, and inspect [preparation memory](../CLOUD.md#preparation-memory)
 before using a constrained machine.
 
+Without `--trajectory`, clearing or switching conversations releases completed
+conversation buffers without creating an export spool. Saved transcripts remain
+available. Current-session compaction history can still occupy memory. With an
+explicit trajectory, completed histories move to a private, unlinked file on the
+session volume; that volume needs free space until the process exits. A failed
+archive write refuses clear/resume and retains live history. Exporting the
+trajectory can materialize the whole history in memory. See
+[completed-session retention](../VERIFICATION.md#completed-session-trajectory-retention)
+for the exact scope and failure checks; this does not guarantee flat process RSS.
+
 On read-only storage, corrupt JSON, or disk exhaustion, preserve existing bytes
 and inspect errors before retrying. A successful-looking preference change should
 be checked after restarting. Do not manually edit a live SQLite catalog or delete

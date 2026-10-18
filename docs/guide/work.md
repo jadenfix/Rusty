@@ -29,6 +29,21 @@ Use `/permissions check <command>` to preview classification without executing
 it. Deny rules and destructive-operation confirmation still matter in Yolo.
 Changing a profile or visibility setting does not grant a command permission.
 
+## Read workspace results accurately
+
+Searches, globs, listings and outlines describe files observed during that query.
+`scan_complete` and `output_truncated` answer different questions: a complete
+scan may show only part of its results, and an incomplete scan cannot establish
+that an absent match does not exist. Check diagnostics for unread paths, limits
+and cancellation before narrowing the next query. Files may change between
+observations; retrieval is not a saved snapshot or task acceptance evidence.
+
+Search uses ripgrep when available. Its grep fallback reports an incomplete scan
+and has different ignore, glob and regex behavior. Glob and outline have their
+own visibility rules, so they can show files omitted by search. Read the
+[workspace query guide](../WORKSPACE_QUERIES.md) for limits, hidden files,
+symlinks, partial results and examples. Reduce scope when a result is clipped.
+
 ## A task with an explicit check
 
 For a bounded local repair, pin an acceptance command:
@@ -102,7 +117,9 @@ Skills supply task instructions; project instruction files include `AGENTS.md`,
 `RUSTY.md` and `CLAUDE.md`. MCP tools come from configured stdio servers; inspect
 `rusty --mcp-check` before depending on them. A missing required tool stops startup,
 while optional broken servers can be skipped with a warning. Cloud tools require
-separate setup: [cloud](../CLOUD.md), [infrastructure](../INFRA.md).
+separate setup: [cloud](../CLOUD.md), [infrastructure](../INFRA.md). Source
+preparation checks archive extraction and cleans its private staging area; a
+preparation success does not establish hosted access or a working model connection.
 
 Check: the intended target and policy are visible, work produces inspectable
 changes, the acceptance check ran, and failures are not mistaken for success.
