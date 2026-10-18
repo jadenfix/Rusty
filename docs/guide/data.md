@@ -26,6 +26,14 @@ it directly. Use Rusty’s session list and resume commands; inspect the type be
 JSON tool, and decompress only a copy when needed. Compression saves storage;
 loading still materializes the transcript in memory.
 
+Long-session saves can reuse compressed history chunks from the current session
+lease instead of recompressing unchanged messages. Shorter history replaces the
+cached chunks; this is a saving optimization, not a transcript deletion policy
+or a hard RAM bound. Plain and compressed transcripts still resume through the
+same reader. Catalog updates can skip unchanged records while retaining recovery
+markers and session ownership. Inspect [session internals](../HOW_IT_WORKS.md#context-and-compact-make-room-on-the-working-desk)
+for the separate roles of context, sessions and memory.
+
 `--memory off` disables memory for the run; it does not erase prior lessons or
 stop a separately running shared memory service. `/clear` keeps memories.
 `/forget <id>` removes a lesson, not the conversation that mentioned it.

@@ -18,7 +18,7 @@ examples, not a substitute for native UI or real-authentication checks.
 cargo test --locked --test documentation
 python3 scripts/check-docs.py
 python3 scripts/record-lifecycle.py --self-test
-cargo xtask qa
+cargo xtask qa --full
 ```
 
 The Python check validates guide presence, links and heading anchors. It also requires a guide mapping for every source module. In CI it maps
@@ -50,6 +50,7 @@ silence drift by changing expected values without checking user-visible behavior
 | View | `default`, `verbose`, `adhd` |
 | Theme | `rust`, `neon`, `matrix`, `amber`, `ice`, `mono`, `paper` |
 | Banner font | `compact`, `rust`, `block`, `thin`, `classic` |
+| Notifications | `off`, `on`, `sound` |
 
 Some surfaces accept additional subcommands: use the menu or `/help` for syntax.
 Keep configuration policy distinct from live endpoint availability: no static

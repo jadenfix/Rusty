@@ -28,7 +28,7 @@
   claiming behavior changed. The coverage check deliberately has no refactor bypass.
 - Run `python3 scripts/check-docs.py --base origin/main`, its `--self-test`, and
   `cargo test --locked --test documentation`. These checks are part of CI;
-  `cargo xtask qa` remains required before pushing.
+  `cargo xtask qa --full` remains the full offline gate required before pushing.
 - For terminal changes, rerun the affected demo after the UI audit on the same
   frozen source/binary. Preserve revision, executable hash, dimensions, real/mock
   provider and outcomes. Never label older recordings as current evidence.

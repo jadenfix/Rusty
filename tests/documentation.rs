@@ -102,11 +102,15 @@ fn configuration_walkthrough_persists_preferences_but_not_session_policy() {
     for key in spec["not_saved"].as_array().unwrap() {
         assert!(saved.get(key.as_str().unwrap()).is_none(), "guide says {key} is not a preference");
     }
-    let restarted = trial.run(&[], Some("/settings\n/exit\n"), None);
+    let restarted = trial.run(&[], Some("/settings\n/ping\n/exit\n"), None);
     let restarted = String::from_utf8_lossy(&restarted.stdout);
     for value in ["neon", "compact", "verbose"] {
         assert!(restarted.contains(value), "preference not reapplied after restart: {value}");
     }
+    assert!(
+        restarted.lines().any(|line| line.trim_start().starts_with("ping on ")),
+        "ping preference not reapplied: {restarted}"
+    );
     assert!(restarted.contains("permissions     auto"), "a session-only policy unexpectedly persisted: {restarted}");
 }
 
@@ -187,6 +191,7 @@ fn reference_tables_and_appearance_choices_are_executable() {
         ("View", "view"),
         ("Theme", "theme"),
         ("Banner font", "font"),
+        ("Notifications", "ping"),
     ];
     for (label, key) in rows {
         let row = guide.lines().find(|line| line.starts_with(&format!("| {label} |"))).expect("reference table row");

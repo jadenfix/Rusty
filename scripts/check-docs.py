@@ -13,7 +13,7 @@ GUIDES = ['README', 'install', 'configure', 'terminal', 'work', 'integrations', 
 AREAS = {
     'install': ['Cargo.toml', 'Dockerfile'],
     'configure': ['src/config.rs', 'src/codex.rs', 'src/doctor.rs', 'src/llm.rs', 'src/anthropic.rs'],
-    'terminal': ['src/ui.rs', 'src/slash.rs', 'src/footer.rs', 'src/display.rs', 'src/signal.rs', 'src/markdown.rs', 'src/tips.rs', 'src/sse.rs'],
+    'terminal': ['src/ui.rs', 'src/slash.rs', 'src/footer.rs', 'src/display.rs', 'src/signal.rs', 'src/markdown.rs', 'src/tips.rs', 'src/sse.rs', 'src/ping.rs'],
     'work': ['src/workspace_query.rs', 'src/agent.rs', 'src/execution.rs', 'src/permissions.rs', 'src/tools.rs', 'src/verification.rs', 'src/budget.rs', 'src/skills.rs', 'src/side.rs', 'src/aside.rs', 'src/swarm.rs', 'src/activity.rs', 'src/infra.rs', 'src/snapshot.rs', 'src/cloud', 'src/bin/rusty-cloud.rs'],
     'integrations': ['src/integrations.rs', 'src/mcp.rs'],
     'sessions': ['src/session.rs', 'src/backend.rs', 'src/inbox.rs'],

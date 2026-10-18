@@ -70,7 +70,7 @@ The template in `.github/pull_request_template.md` keeps this short.
 ## Before you push
 
 ```bash
-cargo xtask qa         # fmt, clippy -D warnings, unit and end-to-end tests
+cargo xtask qa --full  # full offline qualification, including terminal captures
 cargo xtask qa --live  # needs NVIDIA_API_KEY: live tests, terminal checks, evals
 cargo xtask eval TASK  # one eval (or a comma-separated list, or multi)
 cargo xtask tty        # terminal UI changes: real-terminal checks, no key needed

@@ -40,6 +40,21 @@ Paste is different from manually typing: bracketed paste keeps multiline text
 as one draft. Inspect it before submission. Entered shell syntax in a normal
 message is sent to the model; prefix a line with `!` for direct shell execution.
 
+## Optional attention ping
+
+Pings start off. `/ping on` saves a terminal notification for a turn taking at
+least ten seconds or for an approval prompt; `/ping sound` also rings the bell.
+`/ping off` disables it, and `/ping` reports the setting. `RUSTY_PING_AFTER`
+changes the completion threshold in seconds. Approval can ping sooner; repeated
+pings are rate-limited. A user interruption suppresses the ping.
+
+Display and sound depend on the terminal and its notification settings.
+Terminal.app ignores this notification escape; its bell behavior is configured
+in the terminal profile. The notification uses a fixed outcome label and a
+filtered project folder name. “Response ready” means a turn ended; only the
+verified-goal outcome says “goal verified.” Read the actual response and any
+verification result before treating the task as finished.
+
 ## While work runs
 
 The progress row identifies the operation and elapsed time. A busy draft lets

@@ -162,7 +162,8 @@
     "/audit",
     "/doctor",
     "/integrations",
-    "/git"
+    "/git",
+    "/ping"
   ],
   "configure": {
     "lines": [
@@ -171,13 +172,15 @@
       "/view verbose",
       "/tips off",
       "/permissions read-only",
+      "/ping on",
       "/exit"
     ],
     "saved": {
       "theme": "neon",
       "font": "compact",
       "view": "verbose",
-      "tips": false
+      "tips": false,
+      "ping": "on"
     },
     "not_saved": [
       "permissions",
@@ -205,6 +208,11 @@
       "default",
       "verbose",
       "adhd"
+    ],
+    "ping": [
+      "off",
+      "on",
+      "sound"
     ]
   }
 }

@@ -46,7 +46,7 @@ check, send one small prompt and verify a response under the intended provider.
 
 | Setting | How to change it | Scope |
 |---|---|---|
-| Theme, font, view, tips | `/theme`, `/font`, `/view`, `/tips` | Rusty preferences, saved for later launches |
+| Theme, font, view, tips, ping | `/theme`, `/font`, `/view`, `/tips`, `/ping` | Rusty preferences, saved for later launches |
 | Execution/delegation defaults | `/mode`, `/agents`, `/swarm` | Saved preferences; explicit flags/environment can override |
 | Tool location | `/tools local`, `/tools daytona`, `/tools ssh` | Saved default for the next session; remote choices require their bridge launcher |
 | Current model | `/model <id>` or `--model` | Current session; inspect again after restarting |

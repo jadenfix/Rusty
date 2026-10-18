@@ -16,6 +16,21 @@ and reason; ambiguous language can be classified incorrectly. Override the mode
 when you know the intended level of care. Read-only workers report findings;
 the lead decides on edits. Workers consume requests/tokens too.
 
+## Compaction and delegated work
+
+Use `/context` to inspect context usage and `/compact <focus>` to summarize a
+long conversation while naming the constraints that matter. `/compact settings`
+selects the compaction policy. User messages and working-set details have finite
+carry-over budgets; goal and plan state are kept separately from ordinary
+history. Make important requirements explicit and inspect the continuation.
+
+Worker briefs carry the task, constraints and relevant workspace information;
+reports identify inspected paths, findings and unresolved uncertainty. A report
+or path reference still needs checking in the working tree. Careful work can
+state expected outcomes before execution; those expectations are not receipts.
+The [work-loop and context guide](../HOW_IT_WORKS.md) explains these handoffs,
+and [verification evidence](../VERIFICATION.md) records their evaluated limits.
+
 ## Direct commands and approvals
 
 Type `!pwd` to run a direct command without a model request. It still uses the
