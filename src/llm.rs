@@ -372,17 +372,20 @@ impl Client {
 
     /// Runs a chat request on a background thread and streams events back, so
     /// the caller can animate and react to Ctrl-C while waiting. Dropping the
-    /// receiver stops the stream.
+    /// receiver stops the stream. The messages are shared rather than copied:
+    /// the thread lets go of them before it sends `Done`, so a caller that
+    /// holds the other handle can take them back without a copy.
     pub fn start_chat(
         self: &Arc<Self>,
         model: String,
-        messages: Vec<Value>,
+        messages: impl Into<Arc<Vec<Value>>>,
         tools: Value,
         temperature: f32,
         inference: (ExecutionMode, &'static str, Option<u32>),
     ) -> Receiver<Event> {
         let (tx, rx) = channel();
         let me = self.clone();
+        let messages = messages.into();
         std::thread::spawn(move || {
             STATUS.with(|s| *s.borrow_mut() = Some(tx.clone()));
             let held = Held { tx: tx.clone(), reasoning: false, text: String::new(), gone: false };
@@ -391,6 +394,7 @@ impl Client {
                 HELD.with(|h| h.borrow_mut().as_mut().is_none_or(|h| h.push(d)))
             });
             send_held();
+            drop(messages);
             let _ = tx.send(Event::Done(result));
         });
         rx
