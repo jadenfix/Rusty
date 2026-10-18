@@ -108,6 +108,18 @@ casts, the generated manifest and the outcome checks together. Publish GIFs only
 after native playback inspection; retain a text explanation for readers unable
 to view animations. Do not call a simulated fixture a real authentication demo.
 
+The recorder waits for the idle input frame and prompt, not merely the paste
+marker also used during busy input. Failed scenes retain partial casts and a
+failure in the manifest. Cleanup has bounded TERM/KILL escalation for its owned
+unreaped child; any assisted or incomplete cleanup makes the run unsuccessful.
+The mock server limits request bodies, tracks its workers and joins them on exit.
+These safeguards describe the recorder; they do not prove Rusty's resource
+behavior or replace inspection of the final terminal frames.
+Shell tools have their own process groups. Forced cleanup of the CLI group does
+not establish their termination; inspect owned processes after a failed command.
+The cleanup self-test covers a TERM-ignoring direct child, not arbitrary
+descendant containment. Never publish an assisted run as a clean lifecycle demo.
+
 After the recorder completes, render each cast with `agg` (the resize event format
 has been checked with agg 1.9.0). Keep the recording directory and manifest together:
 

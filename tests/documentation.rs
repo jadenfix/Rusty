@@ -120,10 +120,10 @@ fn direct_command_walkthrough_uses_the_project_without_a_model_request() {
         support::reply(0, None, "unexpected model request")
     }));
     let endpoint = format!("{}/v1", server.url);
-    let output = trial.run(&[], Some("!pwd\n/exit\n"), Some(&endpoint));
-    let text = String::from_utf8_lossy(&output.stdout);
+    trial.run(&[], Some("!pwd > .documented-pwd\n/exit\n"), Some(&endpoint));
     let expected = std::fs::canonicalize(&trial.project).unwrap();
-    assert!(text.contains(expected.to_str().unwrap()), "{text}");
+    let actual = std::fs::read_to_string(trial.project.join(".documented-pwd")).unwrap();
+    assert_eq!(actual.trim(), expected.to_str().unwrap());
     assert_eq!(*requests.lock().unwrap(), 0, "the documented direct command must not ask a model");
 }
 

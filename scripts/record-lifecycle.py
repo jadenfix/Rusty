@@ -11,12 +11,26 @@ from pathlib import Path
 import pty
 import select
 import signal
+import socket
 import struct
+import sys
 import tempfile
 import termios
 import threading
 import time
 import unittest
+
+
+def editor_ready_offset(text, start=0):
+    """Busy input also enables paste; require the next idle frame and prompt."""
+    rule = text.find('─' * 20, start)
+    if rule < 0:
+        return None
+    paste = text.find('\x1b[?2004h', rule + 20)
+    if paste < 0:
+        return None
+    prompt = text.find('› ', paste)
+    return prompt if prompt >= 0 else None
 
 
 def sha256_file(path):
@@ -48,6 +62,36 @@ def verify_receipt(receipt, revision, digest, base):
 
 
 class ReceiptTests(unittest.TestCase):
+    def test_failed_scene_cleanup_is_bounded_and_preserves_capture(self):
+        terminal = Terminal.__new__(Terminal)
+        terminal.name = 'cleanup-fixture'; terminal.events = []; terminal.text = ''
+        terminal.decoder = codecs.getincrementaldecoder('utf-8')('replace')
+        terminal.start = time.monotonic(); terminal.reaped = False
+        terminal.columns = 80; terminal.rows = 24
+        terminal.cleanup = {'assisted': False, 'reaped': False, 'exit_code': None}
+        terminal.pid, terminal.fd = pty.fork()
+        if terminal.pid == 0:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            os.write(1, b'cleanup fixture ready\n')
+            time.sleep(30)
+            os._exit(0)
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                terminal.wait('cleanup fixture ready', timeout=3)
+            finally:
+                terminal.close(Path(tmp), quit=False)
+            self.assertTrue(terminal.cleanup['assisted'])
+            self.assertTrue(terminal.cleanup['reaped'])
+            self.assertEqual(terminal.cleanup['exit_code'], -signal.SIGKILL)
+            self.assertIn('cleanup fixture ready', (Path(tmp) / 'cleanup-fixture.cast').read_text())
+
+    def test_busy_paste_marker_cannot_satisfy_idle_readiness(self):
+        busy = '\x1b[?2004hDEMO_STREAM_START\nUnsent draft\nDEMO_STREAM_DONE'
+        self.assertIsNone(editor_ready_offset(busy))
+        idle = '─' * 20 + '\r\n\x1b[?2004h\x1b[1G› '
+        self.assertIsNotNone(editor_ready_offset(busy + idle))
+        self.assertIsNone(editor_ready_offset(idle + busy, len(idle)))
+
     def test_pending_wrong_and_missing_artifacts_are_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); evidence = []
@@ -74,6 +118,7 @@ class Terminal:
         self.name = name; self.events = []; self.text = ''; self.decoder = codecs.getincrementaldecoder('utf-8')('replace')
         self.start = time.monotonic(); self.reaped = False
         self.columns = columns; self.rows = rows
+        self.cleanup = {'assisted': False, 'reaped': False, 'exit_code': None}
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.chdir(cwd)
@@ -88,6 +133,9 @@ class Terminal:
             self.events.append([round(time.monotonic() - self.start, 4), 'r', f'{columns}x{rows}'])
 
     def pump(self, seconds=.05):
+        if self.fd is None:
+            time.sleep(seconds)
+            return
         if select.select([self.fd], [], [], seconds)[0]:
             try: raw = os.read(self.fd, 65536)
             except OSError: raw = b''
@@ -104,7 +152,12 @@ class Terminal:
             self.pump()
 
     def ready(self, start=0):
-        self.wait('\x1b[?2004h', start)
+        deadline = time.monotonic() + 15
+        while (offset := editor_ready_offset(self.text, start)) is None:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f'{self.name}: timed out waiting for the idle frame and prompt')
+            self.pump()
+        return offset
 
     def type(self, text):
         for char in text:
@@ -119,28 +172,50 @@ class Terminal:
 
     def close(self, output, quit=True):
         if self.reaped: return
+        error = None
+        def wait_child(seconds):
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                self.pump()
+                pid, status = os.waitpid(self.pid, os.WNOHANG)
+                if pid:
+                    self.reaped = True
+                    self.cleanup.update(reaped=True, exit_code=os.waitstatus_to_exitcode(status))
+                    return True
+            return False
         try:
             if quit:
-                self.type('/exit'); os.write(self.fd, b'\r')
-                deadline = time.monotonic() + 5
-                while time.monotonic() < deadline:
-                    self.pump()
-                    pid, status = os.waitpid(self.pid, os.WNOHANG)
-                    if pid:
-                        self.reaped = True
-                        if os.waitstatus_to_exitcode(status) != 0:
-                            raise RuntimeError(f'{self.name}: unexpected exit status {status}')
-                        break
+                try:
+                    self.type('/exit'); os.write(self.fd, b'\r')
+                except OSError as exc:
+                    error = exc
+                wait_child(5)
             if not self.reaped:
-                os.kill(self.pid, signal.SIGTERM); os.waitpid(self.pid, 0); self.reaped = True
-                if quit: raise RuntimeError(f'{self.name}: did not exit cleanly')
-            if quit:
+                self.cleanup['assisted'] = True
+                # The direct child is still owned and unreaped. Never signal a
+                # recycled PID/group after harvesting its status.
+                if os.getpgid(self.pid) != self.pid:
+                    raise RuntimeError(f'{self.name}: child process-group identity changed')
+                os.killpg(self.pid, signal.SIGTERM)
+                if not wait_child(2):
+                    os.killpg(self.pid, signal.SIGKILL)
+                    if not wait_child(2):
+                        raise RuntimeError(f'{self.name}: child did not reap after KILL')
+            if quit and (self.cleanup['assisted'] or self.cleanup['exit_code'] != 0):
+                error = RuntimeError(f'{self.name}: did not exit cleanly: {self.cleanup}')
+        finally:
+            try:
+                # Preserve failed and assisted scenes as evidence too.
                 header = dict(version=2, width=self.columns, height=self.rows,
                               title=f'Rusty lifecycle: {self.name} (local mock provider)', env={'TERM': 'xterm-256color'})
                 with (output / f'{self.name}.cast').open('w') as file:
                     for event in [header, *self.events]: file.write(json.dumps(event) + '\n')
-        finally:
-            os.close(self.fd)
+            finally:
+                if self.fd is not None:
+                    os.close(self.fd)
+                    self.fd = None
+        if error:
+            raise error
 
 
 def record(args):
@@ -151,22 +226,74 @@ def record(args):
         raise ValueError('source revision must be a full lowercase Git SHA')
     verify_receipt(receipt, args.source_revision, digest, Path(args.audit_receipt).resolve().parent)
     output = Path(args.output).resolve(); output.mkdir(parents=True, exist_ok=False)
-    requests = []; lock = threading.Lock()
+    requests = []; lock = threading.Lock(); workers = []; sockets = set()
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *_): pass
+        def setup(self):
+            self.request.settimeout(2)
+            super().setup()
         def do_POST(self):
-            body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-            with lock: requests.append(body)
+            try:
+                size = int(self.headers.get('Content-Length', '0'))
+                if not 0 < size <= 2 * 1024 * 1024:
+                    self.send_error(413); return
+                raw = bytearray(); deadline = time.monotonic() + 5
+                while len(raw) < size:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError('request body deadline')
+                    self.connection.settimeout(min(2, remaining))
+                    chunk = self.rfile.read1(min(65536, size - len(raw)))
+                    if not chunk:
+                        raise ValueError('truncated request body')
+                    raw.extend(chunk)
+                self.connection.settimeout(2)
+                body = json.loads(raw)
+            except (ValueError, OSError):
+                self.send_error(400); return
+            with lock:
+                if len(requests) >= 8:
+                    self.send_error(429); return
+                requests.append(body)
             self.send_response(200); self.send_header('Content-Type', 'text/event-stream'); self.end_headers()
             # Slow enough to demonstrate busy draft input without a paid request.
             for text in ['DEMO_STREAM_START\n', *['local demo progress\n'] * 10, 'DEMO_STREAM_DONE\n']:
                 event = {'choices': [{'delta': {'content': text}, 'finish_reason': None}]}
-                self.wfile.write(('data: ' + json.dumps(event) + '\n\n').encode()); self.wfile.flush(); time.sleep(.15)
-            self.wfile.write(b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
-            self.wfile.flush()
+                try:
+                    self.wfile.write(('data: ' + json.dumps(event) + '\n\n').encode()); self.wfile.flush()
+                except OSError:
+                    return
+                time.sleep(.15)
+            try:
+                self.wfile.write(b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+                self.wfile.flush()
+            except OSError:
+                return
 
-    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    class Server(http.server.HTTPServer):
+        def process_request(self, request, address):
+            def serve_request():
+                try:
+                    self.finish_request(request, address)
+                except OSError:
+                    pass
+                finally:
+                    self.shutdown_request(request)
+                    with lock: sockets.discard(request)
+            worker = threading.Thread(target=serve_request, daemon=True)
+            with lock:
+                if len(workers) >= 16:
+                    self.shutdown_request(request); return
+                # Register before start so cleanup cannot miss a new worker.
+                workers.append(worker); sockets.add(request)
+                try:
+                    worker.start()
+                except RuntimeError:
+                    workers.remove(worker); sockets.discard(request)
+                    self.shutdown_request(request)
+                    raise
+    server = Server(('127.0.0.1', 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
     terminals = []; completed = False
     try:
@@ -178,6 +305,8 @@ def record(args):
                    'NVIDIA_API_KEY': 'offline-demo-key', 'RUSTY_BASE_URL': f'http://127.0.0.1:{server.server_port}/v1',
                    'TERM': 'xterm-256color', 'COLORTERM': 'truecolor'}
             def launch(name, extra=()):
+                if sha256_file(binary) != digest:
+                    raise RuntimeError('demo binary changed before launch')
                 t = Terminal(name, binary, project, env, args.columns, args.rows, extra)
                 terminals.append(t); t.ready(); return t
             t = launch('configure-use-quit')
@@ -191,9 +320,8 @@ def record(args):
             first = 'First request in this demonstration.'
             start = len(t.text); t.type(first); os.write(t.fd, b'\r'); t.wait('DEMO_STREAM_START', start)
             t.type('Unsent draft kept during work')
-            t.wait('DEMO_STREAM_DONE', start); t.ready(start)
+            t.wait('DEMO_STREAM_DONE', start); idle = t.ready(start)
             # Busy draft must be present at idle, not submitted as another request.
-            idle = t.text.rfind('\x1b[?2004h')
             t.wait('Unsent draft kept during work', idle)
             if len(requests) != 1: raise RuntimeError('unsent draft triggered another model request')
             os.write(t.fd, b'\x15')
@@ -210,18 +338,57 @@ def record(args):
             t.command('/new', 'fresh context'); t.close(output)
             completed = True
     finally:
+        failure = str(sys.exc_info()[1]) if sys.exc_info()[1] else None
+        cleanup_errors = []
         for t in terminals:
-            if not t.reaped: t.close(output, quit=False)
-        server.shutdown(); server.server_close(); thread.join(timeout=2)
+            if not t.reaped:
+                try: t.close(output, quit=False)
+                except Exception as exc: cleanup_errors.append(f'{t.name}: {exc}')
+        try:
+            server.shutdown()
+        except Exception as exc:
+            cleanup_errors.append(f'mock provider shutdown: {exc}')
+        finally:
+            try: server.server_close()
+            except OSError as exc: cleanup_errors.append(f'mock provider close: {exc}')
+            thread.join(timeout=2)
+            with lock: pending_sockets = list(sockets); pending_workers = list(workers)
+            for connection in pending_sockets:
+                try: connection.shutdown(socket.SHUT_RDWR)
+                except OSError: pass
+                try: connection.close()
+                except OSError as exc: cleanup_errors.append(f'mock connection close: {exc}')
+            join_deadline = time.monotonic() + 3
+            for worker in pending_workers: worker.join(timeout=max(0, join_deadline - time.monotonic()))
+        if thread.is_alive() or any(w.is_alive() for w in pending_workers):
+            cleanup_errors.append('mock provider thread survived cleanup')
+        if any(not t.reaped or t.cleanup['assisted'] for t in terminals):
+            cleanup_errors.append('CLI cleanup was assisted or incomplete')
+        try:
+            digest_after = sha256_file(binary)
+        except OSError:
+            digest_after = None
+        if digest_after != digest:
+            cleanup_errors.append('demo binary changed or disappeared during recording')
+        completed = completed and not cleanup_errors
         manifest = dict(source_revision=args.source_revision, binary_sha256=digest,
+                        binary_sha256_after=digest_after, recorder_sha256=sha256_file(__file__),
                         audit_receipt={k: receipt[k] for k in ['source_revision', 'binary_sha256', 'full_qa', 'native_ui']},
                         audit_evidence=[{'kind': e['kind'], 'sha256': e['sha256']} for e in receipt['evidence']], provider='deterministic local mock; no real authentication',
                         memory='off', terminal={'columns': args.columns, 'rows': args.rows},
                         inference_requests=len(requests), completed=completed,
+                        failure=failure,
+                        cleanup=[dict(scene=t.name, **t.cleanup) for t in terminals],
+                        cleanup_errors=cleanup_errors,
                         scenes=[t.name for t in terminals if (output / f'{t.name}.cast').exists()],
+                        cast_sha256={t.name: sha256_file(output / f'{t.name}.cast')
+                                     for t in terminals if (output / f'{t.name}.cast').exists()},
                         limits=['Not an install test', 'Not native cmux proof', 'Not default daemon cleanup',
+                                'Assisted cleanup covers the CLI process group, not separately grouped shell tools',
                                 'Raw resize playback requires human visual inspection'])
         (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+        if cleanup_errors:
+            raise RuntimeError('; '.join(cleanup_errors))
     print(f'{output}: completed={completed}, mock requests={len(requests)}')
 
 
