@@ -50,8 +50,9 @@ when using `--verify`. Interactive goals can configure a future fixed check with
 `/goal --verify --timeout 120 python3 -B check_public.py`, then pin its file with
 `/goal --pin check_public.py` before starting the goal. Replacing that check clears
 pending pins; it does not weaken an existing goal. Pending settings are local to
-this process, while a started goal saves its criterion. `/goal resume` runs fresh
-verification using that saved criterion. These checks currently use local tools.
+this process, while a started goal saves its criterion. When a resumed goal
+proposes unblocked completion, Rusty reruns its saved check before closing it.
+These checks currently use local tools.
 
 Inspect `goal_outcome` in stats or trajectories: `verified` requires a passing
 fixed check in this process; `completed_unverified` lacks that current receipt.

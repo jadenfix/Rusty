@@ -1315,8 +1315,9 @@ Configure a fixed check before starting an interactive goal:
 `verify` replaces the check (and clears its pins) for future goals. `pin` adds
 one workspace-relative file, capturing its bytes immediately. The default
 check deadline is 120 seconds. `/goal --verify off` disables checks for future
-goals. These commands never weaken an existing goal's criterion; `/goal resume`
-uses that goal's saved criterion and runs fresh verification. Pending settings
+goals. These commands never weaken an existing goal's criterion. `/goal resume`
+uses that goal's saved criterion; when the resumed goal proposes unblocked
+completion, Rusty reruns its saved check before closing it. Pending settings
 are process-local; the criterion is saved once a goal starts. Local tools only.
 
 Stats and trajectories expose `goal_outcome`: `verified` means the fixed check
