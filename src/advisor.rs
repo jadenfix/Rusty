@@ -614,39 +614,50 @@ fn query(board: &Board, observe: bool) -> HashSet<String> {
 /// differ by one word ("the repository's test command is …" against "the
 /// project's test command is …") are the same lesson, and a Jaccard score
 /// would put them under the duplicate line.
+#[cfg(test)]
 fn overlap(a: &str, b: &str) -> f64 {
-    let polarity = |text: &str| {
-        let normalized = text.to_ascii_lowercase().replace("n't", " not");
-        normalized
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .filter(|word| matches!(*word, "no" | "not" | "never" | "without" | "cannot"))
-            .map(str::to_string)
-            .collect::<HashSet<_>>()
-    };
     if polarity(a) != polarity(b) {
         return 0.0;
     }
-    let duplicate_terms = |text: &str| {
-        crate::recall::query(text)
-            .into_iter()
-            .map(|term| {
+    similarity(&duplicate_terms(a), &duplicate_terms(b))
+}
+
+/// Which of a few negations `text` uses, as bits: lessons that disagree on
+/// them are never duplicates, and this is far cheaper than their terms.
+fn polarity(text: &str) -> u8 {
+    const NEGATIONS: [&str; 5] = ["no", "not", "never", "without", "cannot"];
+    let normalized = text.to_ascii_lowercase().replace("n't", " not");
+    normalized
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter_map(|word| NEGATIONS.iter().position(|n| *n == word))
+        .fold(0, |mask, i| mask | 1 << i)
+}
+
+fn duplicate_terms(text: &str) -> HashSet<String> {
+    crate::recall::query(text)
+        .into_iter()
+        .map(
+            |term| {
                 if matches!(term.as_str(), "repo" | "repository" | "project") {
                     "repo_project".to_string()
                 } else {
                     term
                 }
-            })
-            .collect::<HashSet<_>>()
-    };
-    let (a, b) = (duplicate_terms(a), duplicate_terms(b));
-    let shared = a.intersection(&b).count();
+            },
+        )
+        .collect()
+}
+
+/// [`overlap`] of two lessons that agree on negation, from their terms.
+fn similarity(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+    let shared = a.intersection(b).count();
     // A strict subset can add a meaningful command option or value. Do not
     // collapse `run cargo test` with `run cargo test --release` just because
     // all the shorter fact's terms happen to occur in the longer one.
     if a != b && shared == a.len().min(b.len()) {
         return 0.0;
     }
-    let union = a.union(&b).count().max(1);
+    let union = a.union(b).count().max(1);
     shared as f64 / union as f64
 }
 
@@ -883,11 +894,13 @@ impl Engine {
         }
         // A near-duplicate is the same lesson: refresh it instead of adding a
         // copy that would split its outcomes.
-        let twin = self
-            .store
-            .lessons(scope)?
-            .into_iter()
-            .find(|l| l.kind == kind && (l.id == id || overlap(&l.text, &text) >= DUPLICATE));
+        // The new lesson's side is worked out once, not once per stored lesson.
+        let (negations, terms) = (polarity(&text), duplicate_terms(&text));
+        let twin = self.store.lessons(scope)?.into_iter().find(|l| {
+            l.kind == kind
+                && (l.id == id
+                    || (polarity(&l.text) == negations && similarity(&duplicate_terms(&l.text), &terms) >= DUPLICATE))
+        });
         let (prefix, reply_id) = match twin {
             Some(l) => {
                 self.store.db.execute(
@@ -1352,6 +1365,89 @@ mod tests {
         assert!(overlap("run cargo test", "run cargo test --release") < DUPLICATE);
         assert!(overlap("deploy production", "never deploy production") < DUPLICATE);
         assert!(overlap("deploy production", "do not deploy production") < DUPLICATE);
+    }
+
+    /// `overlap` before its halves could be worked out once per text.
+    fn old_overlap(a: &str, b: &str) -> f64 {
+        let polarity = |text: &str| {
+            let normalized = text.to_ascii_lowercase().replace("n't", " not");
+            normalized
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|word| matches!(*word, "no" | "not" | "never" | "without" | "cannot"))
+                .map(str::to_string)
+                .collect::<HashSet<_>>()
+        };
+        if polarity(a) != polarity(b) {
+            return 0.0;
+        }
+        let duplicate_terms = |text: &str| {
+            crate::recall::query(text)
+                .into_iter()
+                .map(|term| {
+                    if matches!(term.as_str(), "repo" | "repository" | "project") {
+                        "repo_project".to_string()
+                    } else {
+                        term
+                    }
+                })
+                .collect::<HashSet<_>>()
+        };
+        let (a, b) = (duplicate_terms(a), duplicate_terms(b));
+        let shared = a.intersection(&b).count();
+        // A strict subset can add a meaningful command option or value. Do not
+        // collapse `run cargo test` with `run cargo test --release` just because
+        // all the shorter fact's terms happen to occur in the longer one.
+        if a != b && shared == a.len().min(b.len()) {
+            return 0.0;
+        }
+        let union = a.union(&b).count().max(1);
+        shared as f64 / union as f64
+    }
+
+    #[test]
+    fn overlap_matches_the_old_one_on_random_lessons() {
+        const WORDS: &[&str] = &[
+            "run",
+            "cargo",
+            "test",
+            "tests",
+            "the",
+            "repo",
+            "repository",
+            "project",
+            "no",
+            "not",
+            "never",
+            "don't",
+            "can't",
+            "CANNOT",
+            "without",
+            "Isn't",
+            "--release",
+            "deploy",
+            "production",
+            "needs",
+            "aws",
+            "profile",
+            "won't",
+            "n't",
+            "nnot't",
+            "parseConfig",
+            "é",
+            "fixtures",
+        ];
+        let mut x: u64 = 0x9e3779b97f4a7c15;
+        let mut next = |n: usize| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n as u64) as usize
+        };
+        for _ in 0..50_000 {
+            let mut lesson = || (0..next(8)).map(|_| WORDS[next(WORDS.len())]).collect::<Vec<_>>().join(" ");
+            let (a, b) = (lesson(), lesson());
+            assert_eq!(overlap(&a, &b).to_bits(), old_overlap(&a, &b).to_bits(), "{a:?} {b:?}");
+        }
     }
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
