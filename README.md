@@ -77,13 +77,18 @@ rusty --version
 # Configure a provider as described in the guide below, then run rusty here.
 ```
 
+Choose the command for your next step below; this block is a reference, not a
+script to run from top to bottom. Replace the example session ID with one from
+`rusty --sessions`.
+
 ```bash
 rusty                                         # interactive
 rusty "why does the build fail?"              # one shot
-rusty --goal "get cargo test green" --verify "cargo test" --yolo
+rusty --goal "get cargo test green" --verify "cargo test"
 rusty -c                                      # resume the last session here
 rusty -c 3f9a12c0                             # resume one by id (a prefix is enough)
-rusty --sessions [words]                      # list the sessions saved here, or search them
+rusty --sessions                              # list sessions saved here
+rusty --sessions parser                       # search saved sessions for a word
 rusty --doctor                                # which providers are set up and answering
 rusty --capabilities                          # accepted values as JSON, for harnesses
 rusty --toolset shell "fix the build"         # offer only bash, for interface experiments
