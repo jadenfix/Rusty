@@ -1,6 +1,6 @@
-# Current CLI recordings
+# CLI recordings and provenance
 
-These clips are actual pseudo-terminal sessions of Rusty, using the live
+The original clips below are historical pseudo-terminal sessions of Rusty, using the live
 `nvidia/nemotron-3-super-120b-a12b` model through NVIDIA's compatible endpoint.
 `permissions` only runs local slash commands and makes no inference request.
 The checked-in `manifest.json` records the source revision, per-scene outcomes,
@@ -75,3 +75,41 @@ Scene definitions live in [`xtask/src/record.rs`](../../xtask/src/record.rs).
 A scene aborts if its expected terminal output does not arrive, rather than
 publishing an incomplete recording as a success. Inspect the cast, final diff,
 and tests before replacing a public GIF.
+
+## Lifecycle demonstrations after a UI audit
+
+Do not replace a historical manifest merely to make a clip look current. The
+[lifecycle checklist](../guide/audit.md) covers acquire/install, first open,
+configuration, use, quit/reopen, fresh context, resume and leaving permanently.
+A fresh recording must name its frozen source and executable hash and state
+which audit gates passed. A local mock-provider demo shows UI transitions and
+context plumbing; it is not evidence of Codex/NVIDIA login.
+
+The [documentation contract](../examples/contract.json) and
+`cargo test --locked --test documentation` exercise settings and resume examples
+without a provider key. The [lifecycle recorder](../../scripts/record-lifecycle.py)
+adds real PTY captures for configuration, direct shell, busy draft, clean exit,
+reopen and fresh context. It uses only a local deterministic mock provider.
+
+```sh
+python3 scripts/record-lifecycle.py --binary /absolute/path/to/rusty \
+  --source-revision FULL_COMMIT_SHA --audit-receipt /path/to/audit.json \
+  --output /path/to/new-recordings
+```
+
+The audit receipt must identify the same `source_revision` and `binary_sha256`,
+with `full_qa` and `native_ui` set to `passed`. Each `evidence` entry must include `path`, `sha256` and `kind` (`full_qa` or
+`native_ui`); paths resolve relative to the receipt. Both kinds are required,
+and referenced bytes are checked before recording. The recorder does not itself
+perform those gates or interpret the logs. Inspect their outcomes before trusting
+the receipt. The recorder refuses mismatched hashes or
+pending gates and does not overwrite an existing output directory. Keep raw
+casts, the generated manifest and the outcome checks together. Publish GIFs only
+after native playback inspection; retain a text explanation for readers unable
+to view animations. Do not call a simulated fixture a real authentication demo.
+
+For a live repair/view/mode demonstration, use the existing scene commands above
+only with explicit provider-spend authorization. Run the actual fixture checks
+after each scene, preserve request accounting, and separate native cmux acceptance
+from PTY playback. Credentials, personal paths and existing sessions must stay
+out of public media.

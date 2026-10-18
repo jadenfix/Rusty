@@ -1,0 +1,184 @@
+{
+  "capabilities": {
+    "contract": 2,
+    "memory": [
+      "off",
+      "recall",
+      "learn",
+      "reflect",
+      "deep"
+    ],
+    "compaction": [
+      "aggressive",
+      "standard",
+      "passive",
+      "smart"
+    ],
+    "mode": [
+      "auto",
+      "careful",
+      "standard",
+      "vibe"
+    ],
+    "agents": [
+      "off",
+      "sub",
+      "swarm",
+      "auto"
+    ],
+    "permissions": [
+      "read-only",
+      "ask",
+      "auto",
+      "yolo"
+    ],
+    "tools": [
+      "local",
+      "daytona"
+    ],
+    "toolset": [
+      "full",
+      "shell"
+    ],
+    "context": {
+      "tokens_flag": true,
+      "history_cap_flag": true,
+      "compaction_model_flag": true,
+      "window_sources": [
+        "flag",
+        "endpoint",
+        "table",
+        "assumed",
+        "overflow"
+      ]
+    },
+    "verify": {
+      "supported": true,
+      "timeout_secs": [
+        1,
+        600
+      ]
+    },
+    "mcp": {
+      "transports": [
+        "stdio"
+      ],
+      "features": [
+        "tools"
+      ],
+      "check": true
+    },
+    "budget": [
+      "max-requests",
+      "max-budget-tokens",
+      "budget-secs",
+      "ledger"
+    ],
+    "stats": [
+      "model_budget",
+      "claims",
+      "safety",
+      "goal",
+      "goal_end",
+      "context",
+      "compactions"
+    ]
+  },
+  "cli_flags": [
+    "--help",
+    "--version",
+    "--capabilities",
+    "--model",
+    "--mode",
+    "--permissions",
+    "--memory",
+    "--agents",
+    "--view",
+    "--sessions",
+    "--continue",
+    "--goal",
+    "--verify",
+    "--verify-timeout",
+    "--doctor",
+    "--list-models",
+    "--mcp-check",
+    "--max-requests",
+    "--max-budget-tokens",
+    "--budget-secs",
+    "--stats",
+    "--trajectory"
+  ],
+  "commands": [
+    "/help",
+    "/exit",
+    "/theme",
+    "/font",
+    "/settings",
+    "/model",
+    "/codex",
+    "/mode",
+    "/view",
+    "/permissions",
+    "/agents",
+    "/swarm",
+    "/tools",
+    "/target",
+    "/goal",
+    "/resume",
+    "/clear",
+    "/side",
+    "/back",
+    "/send",
+    "/btw",
+    "/memory",
+    "/remember",
+    "/forget",
+    "/tokens",
+    "/changes",
+    "/audit",
+    "/doctor"
+  ],
+  "configure": {
+    "lines": [
+      "/theme neon",
+      "/font compact",
+      "/view verbose",
+      "/tips off",
+      "/permissions read-only",
+      "/exit"
+    ],
+    "saved": {
+      "theme": "neon",
+      "font": "compact",
+      "view": "verbose",
+      "tips": false
+    },
+    "not_saved": [
+      "permissions",
+      "model"
+    ]
+  },
+  "appearance": {
+    "theme": [
+      "rust",
+      "neon",
+      "matrix",
+      "amber",
+      "ice",
+      "mono",
+      "paper"
+    ],
+    "font": [
+      "compact",
+      "rust",
+      "block",
+      "thin",
+      "classic"
+    ],
+    "view": [
+      "default",
+      "verbose",
+      "adhd"
+    ]
+  }
+}

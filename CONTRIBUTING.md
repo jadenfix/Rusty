@@ -75,3 +75,24 @@ cargo xtask qa --live  # needs NVIDIA_API_KEY: live tests, terminal checks, eval
 cargo xtask eval TASK  # one eval (or a comma-separated list, or multi)
 cargo xtask tty        # terminal UI changes: real-terminal checks, no key needed
 ```
+
+## Documentation follows behavior
+
+Use the [ordered user guide](docs/guide/README.md) and its
+[source-area map](docs/guide/reference.md) when changing user-facing behavior.
+Update the relevant section plus executable examples/contracts in the same PR.
+A refactor with no behavior change should leave a short check/evidence note in
+that section instead of inventing a user-visible change. `AGENTS.md` is the
+shared repository instruction; there is no second duplicated policy to drift.
+
+Run `python3 scripts/check-docs.py --base origin/main`,
+`python3 scripts/check-docs.py --self-test`, and
+`cargo test --locked --test documentation` in addition to the existing QA gate.
+The contract test exercises the actual built CLI, not a copied implementation.
+CI also checks navigation and source-area documentation coverage. These checks
+cannot prove prose semantics or native visual quality; review both.
+
+After a UI audit, rerun affected demos against the frozen audited build and
+inspect raw playback before replacing public media. Record the source revision,
+binary hash, dimensions, provider type and observed result. Preserve historical
+provenance and name any pending native/authentication/resource checks.
