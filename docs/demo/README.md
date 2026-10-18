@@ -108,6 +108,32 @@ casts, the generated manifest and the outcome checks together. Publish GIFs only
 after native playback inspection; retain a text explanation for readers unable
 to view animations. Do not call a simulated fixture a real authentication demo.
 
+After the recorder completes, render each cast with `agg` (the resize event format
+has been checked with agg 1.9.0). Keep the recording directory and manifest together:
+
+```sh
+recordings=/absolute/path/to/new-recordings
+for scene in configure-use-quit reopen-resume fresh-session; do
+  agg --theme github-dark --font-size 16 --speed 1.5 --idle-time-limit 1.5 \
+    --fps-cap 12 "$recordings/$scene.cast" "$recordings/$scene.gif"
+done
+```
+
+Inspect the whole playback, including both sides of each resize, and the final
+terminal after exit. Confirm the text remains legible and the input is restored
+without a duplicate command, detached cursor or large leftover editor area.
+The scene descriptions below also provide a text alternative to the animations:
+
+| Scene | Outcome to inspect |
+|---|---|
+| `configure-use-quit` | Skin and compact banner, settings, direct `!pwd`, completion during shrink/grow, an unsent draft retained during a mock response, then clean exit |
+| `reopen-resume` | Prior prompt preview without replay; the next request includes the earlier context |
+| `fresh-session` | The earlier context is absent; `/new` returns to fresh context before exit |
+
+These are expected outcomes to verify, not a declaration that this checkout has
+already passed the audit or produced new clips. Record actual results in its
+manifest and audit receipt before linking media from the README.
+
 For a live repair/view/mode demonstration, use the existing scene commands above
 only with explicit provider-spend authorization. Run the actual fixture checks
 after each scene, preserve request accounting, and separate native cmux acceptance
