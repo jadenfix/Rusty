@@ -21,7 +21,7 @@ python3 scripts/record-lifecycle.py --self-test
 cargo xtask qa --full
 ```
 
-The Python check validates guide presence, links and heading anchors. It also requires a guide mapping for every source module. In CI it maps
+The Python check validates guide presence, links and heading anchors. It also requires a guide mapping for every source module, including the CLI and library entry points. In CI it maps
 changed user-facing source areas to their guides and existing deep references. To run that check locally:
 
 ```sh
@@ -63,7 +63,7 @@ list here guarantees a model or remote tool is available to your account.
 | Cargo/package/distribution | [Install](install.md) |
 | Provider/auth/config/doctor | [Configure](configure.md) |
 | Theme/editor/footer/completion/signal/display/markdown | [Terminal](terminal.md) |
-| Agent/tools/workspace queries/permissions/execution/verification/budget | [Work](work.md) |
+| Library entry point/agent/tools/workspace queries/permissions/execution/verification/budget | [Work](work.md) |
 | Repository hosts, remotes and MCP | [Integrations](integrations.md) and the [deep guide](../INTEGRATIONS.md) |
 | Session/backend/main lifecycle | [Sessions](sessions.md) |
 | Archive/advisor/memory/privacy/context/storage | [Data](data.md) |

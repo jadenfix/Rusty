@@ -14,9 +14,9 @@ AREAS = {
     'install': ['Cargo.toml', 'Dockerfile'],
     'configure': ['src/config.rs', 'src/codex.rs', 'src/doctor.rs', 'src/llm.rs', 'src/anthropic.rs'],
     'terminal': ['src/ui.rs', 'src/slash.rs', 'src/footer.rs', 'src/display.rs', 'src/signal.rs', 'src/markdown.rs', 'src/tips.rs', 'src/sse.rs', 'src/ping.rs'],
-    'work': ['src/workspace_query.rs', 'src/agent.rs', 'src/execution.rs', 'src/permissions.rs', 'src/tools.rs', 'src/verification.rs', 'src/budget.rs', 'src/skills.rs', 'src/side.rs', 'src/aside.rs', 'src/swarm.rs', 'src/activity.rs', 'src/infra.rs', 'src/snapshot.rs', 'src/cloud', 'src/bin/rusty-cloud.rs'],
+    'work': ['src/lib.rs', 'src/workspace_query.rs', 'src/agent.rs', 'src/execution.rs', 'src/permissions.rs', 'src/tools.rs', 'src/verification.rs', 'src/budget.rs', 'src/skills.rs', 'src/side.rs', 'src/aside.rs', 'src/swarm.rs', 'src/activity.rs', 'src/infra.rs', 'src/snapshot.rs', 'src/cloud', 'src/bin/rusty-cloud.rs'],
     'integrations': ['src/integrations.rs', 'src/mcp.rs'],
-    'sessions': ['src/session.rs', 'src/backend.rs', 'src/inbox.rs'],
+    'sessions': ['src/main.rs', 'src/session.rs', 'src/backend.rs', 'src/inbox.rs'],
     'data': ['src/archive.rs', 'src/advisor.rs', 'src/privacy.rs', 'src/memory', 'src/bin/rusty-memoryd.rs', 'src/recall.rs', 'src/context.rs'],
 }
 
@@ -38,8 +38,7 @@ def classification_errors(root):
     sources = [source for area in AREAS.values() for source in area]
     return [f'{p.relative_to(root)}: assign this module to its user guide in scripts/check-docs.py'
             for p in sorted((root / 'src').rglob('*.rs'))
-            if str(p.relative_to(root)) not in ['src/main.rs', 'src/lib.rs']
-            and not any(matches(str(p.relative_to(root)), source) for source in sources)]
+            if not any(matches(str(p.relative_to(root)), source) for source in sources)]
 
 
 def maintenance_errors(changed):
@@ -103,7 +102,10 @@ class Checks(unittest.TestCase):
     def test_evidence_cannot_bypass_the_affected_guide(self):
         self.assertTrue(maintenance_errors(['src/agent.rs', 'docs/examples/contract.json']))
         self.assertFalse(maintenance_errors(['src/agent.rs', 'docs/guide/work.md', 'docs/examples/contract.json']))
+        self.assertTrue(maintenance_errors(['src/main.rs']))
         self.assertFalse(maintenance_errors(['src/main.rs', 'docs/guide/sessions.md']))
+        self.assertTrue(maintenance_errors(['src/lib.rs']))
+        self.assertFalse(maintenance_errors(['src/lib.rs', 'docs/guide/work.md']))
         self.assertFalse(maintenance_errors(['tests/documentation.rs']))
         self.assertTrue(maintenance_errors(['src/cloud/api.rs', 'docs/guide/work.md']))
         self.assertFalse(maintenance_errors(['src/cloud/api.rs', 'docs/guide/work.md', 'docs/CLOUD.md']))
