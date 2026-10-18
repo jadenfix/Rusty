@@ -39,7 +39,11 @@ A long conversation can add transcripts, catalog records, captures and memory.
 Compaction reduces active context; it is not a storage deletion policy. Provider
 budgets do not impose OS RAM or filesystem quotas. Very large paste, output and
 session lists should be tested with bounded inputs before relying on them in a
-constrained environment.
+constrained environment. File reads still load the full UTF-8 file before formatting
+a selected line range; a small requested range does not impose a RAM cap. Cloud
+preparation now spools its largest build context to a private unlinked temporary
+file: allow temporary disk space, and inspect [preparation memory](../CLOUD.md#preparation-memory)
+before using a constrained machine.
 
 On read-only storage, corrupt JSON, or disk exhaustion, preserve existing bytes
 and inspect errors before retrying. A successful-looking preference change should
