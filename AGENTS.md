@@ -18,6 +18,24 @@
 - Eval checks stay hidden from the agent: never copy `check.sh` or `check.py`
   into the task's `files/`.
 
+## Keep the user journey accurate
+
+- User-visible changes must update the affected [lifecycle guide](docs/guide/README.md)
+  and its examples/tests in the same PR. Follow the source-area map in
+  [reference](docs/guide/reference.md); explain verified unchanged behavior when
+  an implementation change does not alter the user contract. The same rule applies
+  to mapped deep references: record the concrete invariant and check rather than
+  claiming behavior changed. The coverage check deliberately has no refactor bypass.
+- Run `python3 scripts/check-docs.py --base origin/main`, its `--self-test`, and
+  `cargo test --locked --test documentation`. These checks are part of CI;
+  `cargo xtask qa --full` remains the full offline gate required before pushing.
+- For terminal changes, rerun the affected demo after the UI audit on the same
+  frozen source/binary. Preserve revision, executable hash, dimensions, real/mock
+  provider and outcomes. Never label older recordings as current evidence.
+- Review installation, precedence/persistence, cancellation, session ownership,
+  error recovery and service/data lifetime, not just the happy path. Keep paid
+  provider and native checks separate from offline receipts.
+
 ## Performance
 
 - `cargo xtask bench` measures what a user waits on, offline and from fixed

@@ -1,6 +1,6 @@
-# Current CLI recordings
+# CLI recordings and provenance
 
-These clips are actual pseudo-terminal sessions of Rusty, using the live
+The original clips below are historical pseudo-terminal sessions of Rusty, using the live
 `nvidia/nemotron-3-super-120b-a12b` model through NVIDIA's compatible endpoint.
 `permissions` only runs local slash commands and makes no inference request.
 The checked-in `manifest.json` records the source revision, per-scene outcomes,
@@ -75,3 +75,79 @@ Scene definitions live in [`xtask/src/record.rs`](../../xtask/src/record.rs).
 A scene aborts if its expected terminal output does not arrive, rather than
 publishing an incomplete recording as a success. Inspect the cast, final diff,
 and tests before replacing a public GIF.
+
+## Lifecycle demonstrations after a UI audit
+
+Do not replace a historical manifest merely to make a clip look current. The
+[lifecycle checklist](../guide/audit.md) covers acquire/install, first open,
+configuration, use, quit/reopen, fresh context, resume and leaving permanently.
+A fresh recording must name its frozen source and executable hash and state
+which audit gates passed. A local mock-provider demo shows UI transitions and
+context plumbing; it is not evidence of Codex/NVIDIA login.
+
+The [documentation contract](../examples/contract.json) and
+`cargo test --locked --test documentation` exercise settings and resume examples
+without a provider key. The [lifecycle recorder](../../scripts/record-lifecycle.py)
+adds real PTY captures for configuration, direct shell, busy draft, clean exit,
+reopen and fresh context. It uses only a local deterministic mock provider.
+
+```sh
+python3 scripts/record-lifecycle.py --binary /absolute/path/to/rusty \
+  --source-revision FULL_COMMIT_SHA --audit-receipt /path/to/audit.json \
+  --output /path/to/new-recordings
+```
+
+The audit receipt must identify the same `source_revision` and `binary_sha256`,
+with `full_qa` and `native_ui` set to `passed`. Each `evidence` entry must include `path`, `sha256` and `kind` (`full_qa` or
+`native_ui`); paths resolve relative to the receipt. Both kinds are required,
+and referenced bytes are checked before recording. The recorder does not itself
+perform those gates or interpret the logs. Inspect their outcomes before trusting
+the receipt. The recorder refuses mismatched hashes or
+pending gates and does not overwrite an existing output directory. Keep raw
+casts, the generated manifest and the outcome checks together. Publish GIFs only
+after native playback inspection; retain a text explanation for readers unable
+to view animations. Do not call a simulated fixture a real authentication demo.
+
+The recorder waits for the idle input frame and prompt, not merely the paste
+marker also used during busy input. Failed scenes retain partial casts and a
+failure in the manifest. Cleanup has bounded TERM/KILL escalation for its owned
+unreaped child; any assisted or incomplete cleanup makes the run unsuccessful.
+The mock server limits request bodies, tracks its workers and joins them on exit.
+These safeguards describe the recorder; they do not prove Rusty's resource
+behavior or replace inspection of the final terminal frames.
+Shell tools have their own process groups. Forced cleanup of the CLI group does
+not establish their termination; inspect owned processes after a failed command.
+The cleanup self-test covers a TERM-ignoring direct child, not arbitrary
+descendant containment. Never publish an assisted run as a clean lifecycle demo.
+
+After the recorder completes, render each cast with `agg` (the resize event format
+has been checked with agg 1.9.0). Keep the recording directory and manifest together:
+
+```sh
+recordings=/absolute/path/to/new-recordings
+for scene in configure-use-quit reopen-resume fresh-session; do
+  agg --theme github-dark --font-size 16 --speed 1.5 --idle-time-limit 1.5 \
+    --fps-cap 12 "$recordings/$scene.cast" "$recordings/$scene.gif"
+done
+```
+
+Inspect the whole playback, including both sides of each resize, and the final
+terminal after exit. Confirm the text remains legible and the input is restored
+without a duplicate command, detached cursor or large leftover editor area.
+The scene descriptions below also provide a text alternative to the animations:
+
+| Scene | Outcome to inspect |
+|---|---|
+| `configure-use-quit` | Skin and compact banner, settings, direct `!pwd`, completion during shrink/grow, an unsent draft retained during a mock response, then clean exit |
+| `reopen-resume` | Prior prompt preview without replay; the next request includes the earlier context |
+| `fresh-session` | The earlier context is absent; `/new` returns to fresh context before exit |
+
+These are expected outcomes to verify, not a declaration that this checkout has
+already passed the audit or produced new clips. Record actual results in its
+manifest and audit receipt before linking media from the README.
+
+For a live repair/view/mode demonstration, use the existing scene commands above
+only with explicit provider-spend authorization. Run the actual fixture checks
+after each scene, preserve request accounting, and separate native cmux acceptance
+from PTY playback. Credentials, personal paths and existing sessions must stay
+out of public media.

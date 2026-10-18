@@ -363,3 +363,15 @@ spooled to a private, immediately unlinked temporary file through a 64 KiB
 buffer. The payload hash is computed during writing, and the buffer is flushed
 before the archive is rewound for upload. Allow temporary disk space for the
 largest context. Archive bytes and context identifiers remain compatible.
+
+### Source archive extraction
+
+Source preparation extracts Git archives from a private staging file rather than
+feeding tar through a pipe. Tar may finish a valid archive before consuming its
+trailing zero padding; that is not a preparation failure. The extractor checks
+tar’s exit status and removes its owned staging directory on success or failure.
+Staging is outside the source contents, so a tracked `.rusty-source.tar` remains
+an ordinary project file and is not removed during cleanup. Invalid archive
+input fails preparation. This describes local source preparation, not a hosted
+sandbox or authentication qualification. The padded-archive and invalid-input
+regressions preserve that tracked filename in both cases.

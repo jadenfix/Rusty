@@ -25,7 +25,7 @@
 
 <img src="docs/demo/mode-standard.gif" alt="rusty finds and fixes two bugs in a small shop app, then runs the tests" width="100%">
 
-<sub>A fresh terminal capture from the current CLI: inspect the failing discount tests, edit the source, and run the tests. Playback is 1.5×; idle gaps are capped at 1.5 seconds.</sub>
+<sub>A historical terminal capture (revision recorded in docs/demo/manifest.json): inspect the failing discount tests, edit the source, and run the tests. Playback is 1.5×; idle gaps are capped at 1.5 seconds.</sub>
 
 </div>
 
@@ -46,12 +46,70 @@ flowchart LR
 ```
 
 Jump to [everyday feature explanations](#everyday-features-explained),
-[quickstart](#quickstart), [demos](#see-the-modes-in-action), or
+[start here](#start-here), [demos](#see-the-modes-in-action), or
 [the command reference](#commands).
 
 **[Read the simple architecture guide](docs/HOW_IT_WORKS.md)** for diagrams
 and plain explanations of `/goal`, memory, compaction, subagents, swarms,
 execution modes, permissions, side discussions, sessions, tools, and budgets.
+
+## Start here
+
+[Full user guide](docs/guide/README.md) · [Install/update](docs/guide/install.md) ·
+[Configure/login](docs/guide/configure.md) · [Terminal controls](docs/guide/terminal.md) ·
+[Work/verify](docs/guide/work.md) · [Quit/resume](docs/guide/sessions.md) ·
+[Saved data](docs/guide/data.md) · [Troubleshooting](docs/guide/troubleshooting.md)
+
+The guides follow the full lifecycle: install, connect, configure, use, quit,
+return later, or leave permanently. Git, Rust/Cargo and a native build environment
+are prerequisites. If the executable is missing or looks outdated, check the
+actual PATH, source revision and binary hash before retrying an installation.
+For Codex sign-in use `codex login`, then `RUSTY_PROVIDER=codex rusty`; for API
+providers configure the appropriate key. Credentials saved is not the same as a
+successful model response. [Configuration details](docs/guide/configure.md).
+
+```bash
+git --version && rustc --version && cargo --version
+git clone https://github.com/jadenfix/rusty && cd rusty
+cargo install --locked --path .
+command -v rusty
+rusty --version
+# Configure a provider as described in the guide below, then run rusty here.
+```
+
+Choose the command for your next step below; this block is a reference, not a
+script to run from top to bottom. Replace the example session ID with one from
+`rusty --sessions`.
+
+```bash
+rusty                                         # interactive
+rusty "why does the build fail?"              # one shot
+rusty --goal "get cargo test green" --verify "cargo test"
+rusty -c                                      # resume the last session here
+rusty -c 3f9a12c0                             # resume one by id (a prefix is enough)
+rusty --sessions                              # list sessions saved here
+rusty --sessions parser                       # search saved sessions for a word
+rusty --doctor                                # which providers are set up and answering
+rusty --capabilities                          # accepted values as JSON, for harnesses
+rusty --toolset shell "fix the build"         # offer only bash, for interface experiments
+```
+
+Interactive resume (`rusty -c` or `/resume <id>`) shows recent requests and replies above the input. The preview is bounded to the terminal size; saved context is retained, with no inference request or command replay. Normal startup can still query a provider model catalog for context size; see the [resume guide](docs/guide/sessions.md).
+
+While a turn or side session runs, type the next message in the bottom draft row. Enter queues it; Backspace edits and Ctrl-U clears the draft. Unsent text returns to the normal editor when work finishes. After Ctrl-C, queued text is held for review instead of being sent immediately.
+
+
+Keys come from your shell, then `~/.config/rusty/.env`, then the `.env` next
+to rusty's `Cargo.toml`. Set any of `NVIDIA_API_KEY`, `ANTHROPIC_API_KEY` and
+`OPENAI_API_KEY`; with several keys for one provider (`ANTHROPIC_API_KEY_2`,
+…), rusty rotates through them and backs off politely when rate limited:
+it keeps retrying rate limits and server errors for up to five minutes
+(`RUSTY_RETRY_SECS`), with jitter so parallel agents don't retry in step, and
+gives up quickly on a key that is refused. While it waits, the panel says so
+(`retrying in 8s · HTTP 429 …`). A reply that goes quiet for five minutes
+(`RUSTY_STREAM_IDLE_SECS`) is dropped and asked for again, as long as no
+answer text has been shown yet.
+
 
 ## See the modes in action
 
@@ -59,7 +117,9 @@ Rusty runs in your terminal, with local tools, streamed answers, saved sessions,
 and checks you can inspect. Choose how it works with `/mode`, how much it shows
 with `/view`, and what it may do with `/permissions`. These are separate settings.
 
-The recordings below use the real CLI and a live NVIDIA Nemotron provider.
+The historical recordings below use the real CLI and a live NVIDIA Nemotron provider.
+Their exact source revision is recorded in the demo manifest; they do not qualify
+the current UI or your account connection.
 Each execution demo starts with a fresh copy of [`demo/shop`](demo/shop), including
 the same failing discount tests. They show observed runs, not a speed or model
 quality comparison. [Capture details and reproduction commands](docs/demo/README.md).
@@ -388,42 +448,6 @@ spelling.
 shows saved choices; command-line options can override relevant choices for a
 run. `/help` lists commands. The [command reference](#commands) below keeps the
 exact syntax in one place.
-
-## Quickstart
-
-```bash
-git clone https://github.com/jadenfix/rusty && cd rusty
-cp .env.example .env        # add NVIDIA_API_KEY, ANTHROPIC_API_KEY or OPENAI_API_KEY (or skip it after `codex login`)
-cargo install --path .
-```
-
-```bash
-rusty                                         # interactive
-rusty "why does the build fail?"              # one shot
-rusty --goal "get cargo test green" --verify "cargo test" --yolo
-rusty -c                                      # resume the last session here
-rusty -c 3f9a12c0                             # resume one by id (a prefix is enough)
-rusty --sessions [words]                      # list the sessions saved here, or search them
-rusty --doctor                                # which providers are set up and answering
-rusty --capabilities                          # accepted values as JSON, for harnesses
-rusty --toolset shell "fix the build"         # offer only bash, for interface experiments
-```
-
-Interactive resume (`rusty -c` or `/resume <id>`) shows recent requests and replies above the input. The preview is bounded to the terminal size; saved context is retained, with no model request or command replay.
-
-While a turn or side session runs, type the next message in the bottom draft row. Enter queues it; Backspace edits and Ctrl-U clears the draft. Unsent text returns to the normal editor when work finishes. After Ctrl-C, queued text is held for review instead of being sent immediately.
-
-
-Keys come from your shell, then `~/.config/rusty/.env`, then the `.env` next
-to rusty's `Cargo.toml`. Set any of `NVIDIA_API_KEY`, `ANTHROPIC_API_KEY` and
-`OPENAI_API_KEY`; with several keys for one provider (`ANTHROPIC_API_KEY_2`,
-…), rusty rotates through them and backs off politely when rate limited:
-it keeps retrying rate limits and server errors for up to five minutes
-(`RUSTY_RETRY_SECS`), with jitter so parallel agents don't retry in step, and
-gives up quickly on a key that is refused. While it waits, the panel says so
-(`retrying in 8s · HTTP 429 …`). A reply that goes quiet for five minutes
-(`RUSTY_STREAM_IDLE_SECS`) is dropped and asked for again, as long as no
-answer text has been shown yet.
 
 ## Commands
 
