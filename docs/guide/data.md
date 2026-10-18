@@ -1,4 +1,4 @@
-# 6. Saved data and resources
+# 7. Saved data and resources
 
 Rusty does not equate closing a terminal, forgetting a lesson, deleting a
 conversation, signing out and uninstalling. Each affects different state.

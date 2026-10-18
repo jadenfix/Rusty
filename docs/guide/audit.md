@@ -11,6 +11,7 @@ result for each row; do not carry a pass from an older binary to a new build.
 | Use | Small real prompt on the intended provider, output/exit, direct shell without a model call, approval then cancellation |
 | Manipulate UI | Wide/narrow/short panes; grow/shrink with completion open and while streaming; scroll and switch panes; light/dark/NO_COLOR |
 | Input | Unicode, multiline/bracketed paste, unsent busy draft, queued follow-up, Ctrl-U, Ctrl-C, review before resending |
+| Integrations | Keyless status/setup; explicit host access; origin/upstream and enterprise selection; MCP list without execution, explicit check and next-session reload |
 | Work surfaces | Modes/views/permissions independently; side/main ownership, active jobs, stop/redirect, explicit verification |
 | Quit | `/exit` and aliases, Ctrl-D, repeated idle Ctrl-C and rapid active-work double Ctrl-C; no duplicate command or stray cursor below the editor |
 | Return | New process, recent preview, no replay/model call on load, continued context, fresh session and `/new` separation |

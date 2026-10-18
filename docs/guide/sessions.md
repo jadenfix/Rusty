@@ -1,4 +1,4 @@
-# 5. Quit and return
+# 6. Quit and return
 
 A session is saved conversation context, not a saved running process. Resuming
 does not revive a shell child, roll back changes, or prove the last task finished.

@@ -172,3 +172,45 @@ fn reference_tables_and_appearance_choices_are_executable() {
         }
     }
 }
+
+#[test]
+fn integration_walkthrough_is_keyless_and_keeps_project_remote_selection() {
+    let trial = Trial::new();
+    for args in [
+        vec!["init", "-q"],
+        vec!["remote", "add", "origin", "https://github.com/example/project.git"],
+        vec!["remote", "add", "upstream", "https://gitlab.example.test/team/project.git"],
+    ] {
+        let output = Command::new("git")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", trial.root.path().join("user"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .current_dir(&trial.project)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+    let run = |args: &[&str]| {
+        let mut cmd = trial.cmd();
+        cmd.env_remove("NVIDIA_API_KEY").args(["--integrations"]).args(args);
+        let output = support::wait(cmd.spawn().unwrap(), Duration::from_secs(15));
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let status = run(&[]);
+    assert!(status.contains("github: github.com/example/project"), "{status}");
+    assert!(status.contains("Authentication not checked"), "{status}");
+    assert!(run(&["setup", "github"]).contains("gh auth login"));
+    assert!(run(&["configure", "gitlab", "upstream"]).contains("no credentials stored"));
+    let restarted = run(&["status"]);
+    assert!(restarted.contains("gitlab: gitlab.example.test/team/project"), "{restarted}");
+    assert!(restarted.contains("remote: upstream"), "{restarted}");
+    assert!(run(&["setup", "gitlab"]).contains("gitlab.example.test"));
+    let listed: Value = serde_json::from_str(&run(&["mcp", "list"])).unwrap();
+    assert_eq!(listed, serde_json::json!({"servers":[]}));
+    assert!(!trial.project.join(".mcp.json").exists(), "listing must not create configuration");
+    run(&["configure", "auto", "origin"]);
+    assert!(run(&["status"]).contains("github: github.com/example/project"));
+}

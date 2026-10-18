@@ -1,4 +1,4 @@
-# 7. Recover by symptom
+# 8. Recover by symptom
 
 | Symptom | First useful check |
 |---|---|

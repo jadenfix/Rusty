@@ -9,17 +9,19 @@ import unittest
 from urllib.parse import unquote, urlsplit
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-GUIDES = ['README', 'install', 'configure', 'terminal', 'work', 'sessions', 'data', 'troubleshooting', 'reference', 'audit']
+GUIDES = ['README', 'install', 'configure', 'terminal', 'work', 'integrations', 'sessions', 'data', 'troubleshooting', 'reference', 'audit']
 AREAS = {
     'install': ['Cargo.toml', 'Dockerfile'],
     'configure': ['src/config.rs', 'src/codex.rs', 'src/doctor.rs', 'src/llm.rs', 'src/anthropic.rs'],
     'terminal': ['src/ui.rs', 'src/slash.rs', 'src/footer.rs', 'src/display.rs', 'src/signal.rs', 'src/markdown.rs', 'src/tips.rs', 'src/sse.rs'],
-    'work': ['src/agent.rs', 'src/execution.rs', 'src/permissions.rs', 'src/tools.rs', 'src/verification.rs', 'src/budget.rs', 'src/mcp.rs', 'src/skills.rs', 'src/side.rs', 'src/aside.rs', 'src/swarm.rs', 'src/activity.rs', 'src/infra.rs', 'src/snapshot.rs', 'src/cloud', 'src/bin/rusty-cloud.rs'],
+    'work': ['src/agent.rs', 'src/execution.rs', 'src/permissions.rs', 'src/tools.rs', 'src/verification.rs', 'src/budget.rs', 'src/skills.rs', 'src/side.rs', 'src/aside.rs', 'src/swarm.rs', 'src/activity.rs', 'src/infra.rs', 'src/snapshot.rs', 'src/cloud', 'src/bin/rusty-cloud.rs'],
+    'integrations': ['src/integrations.rs', 'src/mcp.rs'],
     'sessions': ['src/session.rs', 'src/backend.rs', 'src/inbox.rs'],
     'data': ['src/advisor.rs', 'src/privacy.rs', 'src/memory', 'src/bin/rusty-memoryd.rs', 'src/recall.rs', 'src/context.rs'],
 }
 
 DEEP_AREAS = {
+    'docs/INTEGRATIONS.md': ['src/integrations.rs', 'src/mcp.rs'],
     'docs/CLOUD.md': ['src/cloud', 'src/bin/rusty-cloud.rs'],
     'docs/MEMORY.md': ['src/advisor.rs', 'src/recall.rs', 'src/bin/rusty-memoryd.rs'],
     'docs/VERIFICATION.md': ['src/verification.rs'],
@@ -91,6 +93,8 @@ def navigation_errors(root):
 
 class Checks(unittest.TestCase):
     def test_runtime_change_needs_its_guide(self):
+        self.assertTrue(maintenance_errors(['src/integrations.rs', 'docs/guide/integrations.md']))
+        self.assertFalse(maintenance_errors(['src/integrations.rs', 'docs/guide/integrations.md', 'docs/INTEGRATIONS.md']))
         self.assertTrue(maintenance_errors(['src/ui.rs']))
         self.assertFalse(maintenance_errors(['src/ui.rs', 'docs/guide/terminal.md']))
         self.assertTrue(maintenance_errors(['src/session.rs', 'docs/guide/terminal.md']))

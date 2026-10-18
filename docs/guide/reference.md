@@ -1,4 +1,4 @@
-# 8. Reference and documentation checks
+# 9. Reference and documentation checks
 
 `rusty --help` gives this binary's flags. `/help` gives its interactive command
 catalog. `rusty --capabilities` prints accepted values as JSON without requiring
@@ -8,7 +8,7 @@ an old screenshot or a guide for a different revision.
 The checked [documentation contract](../examples/contract.json) records the
 capability contract, documented flags/commands and one configuration walkthrough.
 `tests/documentation.rs` compares it with the actual built binary, verifies
-preference persistence across processes, and checks no-request resume, follow-up
+keyless integration setup and project-specific remote persistence, preference persistence across processes, and checks no-request resume, follow-up
 context and fresh-session isolation using a local provider. These are executable
 examples, not a substitute for native UI or real-authentication checks.
 
@@ -58,7 +58,8 @@ list here guarantees a model or remote tool is available to your account.
 | Cargo/package/distribution | [Install](install.md) |
 | Provider/auth/config/doctor | [Configure](configure.md) |
 | Theme/editor/footer/completion/signal/display/markdown | [Terminal](terminal.md) |
-| Agent/tools/permissions/execution/verification/budget/MCP | [Work](work.md) |
+| Agent/tools/permissions/execution/verification/budget | [Work](work.md) |
+| Repository hosts, remotes and MCP | [Integrations](integrations.md) and the [deep guide](../INTEGRATIONS.md) |
 | Session/backend/main lifecycle | [Sessions](sessions.md) |
 | Advisor/memory/privacy/context/storage | [Data](data.md) |
 | Cloud, memory service, verification, infrastructure | Their linked deep references as well as the journey guide |

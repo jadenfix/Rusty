@@ -82,7 +82,26 @@
       "goal_end",
       "context",
       "compactions"
-    ]
+    ],
+    "integrations": {
+      "flag": true,
+      "hosts": [
+        "github",
+        "gitlab",
+        "bitbucket-cloud"
+      ],
+      "git_views": [
+        "status",
+        "diff",
+        "log"
+      ],
+      "mcp_management": [
+        "list",
+        "add",
+        "remove",
+        "check"
+      ]
+    }
   },
   "cli_flags": [
     "--help",
@@ -106,7 +125,8 @@
     "--max-budget-tokens",
     "--budget-secs",
     "--stats",
-    "--trajectory"
+    "--trajectory",
+    "--integrations"
   ],
   "commands": [
     "/help",
@@ -136,7 +156,9 @@
     "/tokens",
     "/changes",
     "/audit",
-    "/doctor"
+    "/doctor",
+    "/integrations",
+    "/git"
   ],
   "configure": {
     "lines": [

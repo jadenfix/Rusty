@@ -68,3 +68,6 @@ separate setup: [cloud](../CLOUD.md), [infrastructure](../INFRA.md).
 
 Check: the intended target and policy are visible, work produces inspectable
 changes, the acceptance check ran, and failures are not mistaken for success.
+
+For repository host setup, project remotes and MCP management, continue with
+[Connect repositories and tools](integrations.md).
