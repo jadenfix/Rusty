@@ -1860,8 +1860,12 @@ impl Agent {
         };
         // A refused call never ran. The notes are redacted below with the rest.
         if refusal.is_none() {
+            let current = self.hooked(HookEvent::PostToolUse, &call.name).then(|| self.current_reads());
             for note in self.run_hooks(HookEvent::PostToolUse, &call.name, &args, Some((&text, ok)), d) {
                 text.push_str(&format!("\n\nPostToolUse hook: {note}"));
+            }
+            if let Some(current) = current {
+                self.adopt_hook_rewrites(current);
             }
         }
         if ok && self.is_worker && self.board.is_some() {
@@ -1896,6 +1900,30 @@ impl Agent {
     /// so with remote tools they would act on a checkout the tools never touch.
     fn hooked(&self, event: HookEvent, name: &str) -> bool {
         self.backend.name() == "local" && self.hooks.matches(event, name)
+    }
+
+    /// The files read that are still as the agent last saw them, by digest.
+    fn current_reads(&self) -> Vec<(String, String)> {
+        self.read_versions
+            .iter()
+            .filter(|(path, (seen, _))| {
+                crate::inbox::file_version(&self.cwd, path).is_some_and(|(_, now)| now == *seen)
+            })
+            .map(|(path, (seen, _))| (path.clone(), seen.clone()))
+            .collect()
+    }
+
+    /// Files a PostToolUse hook rewrote, such as a formatter's, changed by
+    /// the user's own step rather than behind the agent's back, so the next
+    /// edit there needs no re-read. The agent hasn't seen the new text, so an
+    /// overwrite still needs the whole file read first, and an edit whose
+    /// old_string the hook changed fails to match and says so.
+    fn adopt_hook_rewrites(&mut self, before: Vec<(String, String)>) {
+        for (path, seen) in before {
+            if let Some((_, now)) = crate::inbox::file_version(&self.cwd, &path).filter(|(_, now)| *now != seen) {
+                self.read_versions.insert(path, (now, false));
+            }
+        }
     }
 
     /// The user's PreToolUse hooks for one call; an error when one blocked it.
@@ -4179,6 +4207,38 @@ mod read_first_tests {
         assert_eq!(std::fs::read_to_string(&old).unwrap(), "keep\n");
         run(&mut a, "read_file", json!({"path": old}));
         assert!(run(&mut a, "write_file", json!({"path": old, "content": "gone\n"})).text.starts_with("wrote"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_post_tool_hook_rewrite_does_not_force_a_re_read_before_editing() {
+        let dir = std::env::temp_dir().join(format!("rusty-agent-hook-rewrite-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a_txt, b_txt) = (dir.join("a.txt"), dir.join("b.txt"));
+        std::fs::write(&a_txt, "one\n").unwrap();
+        std::fs::write(&b_txt, "bee\n").unwrap();
+        let (a_path, b_path) = (a_txt.display().to_string(), b_txt.display().to_string());
+        let mut a = agent(dir.clone(), Mode::Yolo);
+        // A "formatter" that rewrites the edited file and one beside it.
+        a.hooks = serde_json::from_value(json!({"PostToolUse": [{
+            "matcher": "edit_file",
+            "command": "printf '# fmt\\n' >> a.txt; printf 'BEE\\n' > b.txt",
+        }]}))
+        .unwrap();
+        run(&mut a, "read_file", json!({"path": a_path}));
+        run(&mut a, "read_file", json!({"path": b_path}));
+        let edit = run(&mut a, "edit_file", json!({"path": a_path, "old_string": "one", "new_string": "two"}));
+        assert!(edit.text.starts_with("edited"), "{}", edit.text);
+        assert_eq!(std::fs::read_to_string(&a_txt).unwrap(), "two\n# fmt\n");
+
+        // Both rewritten files can be edited again without a read...
+        let again = run(&mut a, "edit_file", json!({"path": a_path, "old_string": "two", "new_string": "three"}));
+        assert!(again.text.starts_with("edited"), "{}", again.text);
+        let beside = run(&mut a, "edit_file", json!({"path": b_path, "old_string": "BEE", "new_string": "bee"}));
+        assert!(beside.text.starts_with("edited"), "{}", beside.text);
+        // ...but not overwritten whole, since the agent never saw the rewrite.
+        let overwrite = run(&mut a, "write_file", json!({"path": b_path, "content": "x\n"}));
+        assert!(overwrite.text.contains("only part of"), "{}", overwrite.text);
         let _ = std::fs::remove_dir_all(dir);
     }
 
