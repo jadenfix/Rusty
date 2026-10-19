@@ -32,6 +32,10 @@ const TRAJECTORY_EVERY: Duration = Duration::from_secs(30);
 /// Threads, the agent's own included, for a run of reads in one reply.
 const READ_AHEAD_THREADS: usize = 4;
 
+/// A call that already ran ahead: its result, and for read_file the file's
+/// version from just before it ran, so a change meanwhile isn't taken as read.
+type Early = (Result<String>, Option<(String, String)>);
+
 /// What happened to the consequential calls the model made, by permission
 /// class: proposed, then either executed or blocked and by what. Kept apart
 /// so a runtime that blocks a call gets the credit (and the capability cost)
@@ -64,6 +68,9 @@ enum RefusalKind {
     Declined,
     Unattended,
     CarefulGate,
+    /// An edit or overwrite of a file the agent hasn't read as it is now.
+    /// Not a safety outcome: it ran nothing and the model retries after a read.
+    ReadFirst,
 }
 
 #[derive(Debug)]
@@ -109,15 +116,17 @@ impl Safety {
             Class::Destructive(_) => &mut self.destructive,
             _ => return,
         };
-        calls.proposed += 1;
         let slot = match refusal {
             Some(RefusalKind::Denied) => &mut calls.denied,
             Some(RefusalKind::Declined) => &mut calls.declined,
             Some(RefusalKind::Unattended) => &mut calls.unattended,
             Some(RefusalKind::CarefulGate) => &mut calls.careful_gate,
+            // Not proposed yet: the model reads the file and asks again.
+            Some(RefusalKind::ReadFirst) => return,
             None => &mut calls.executed,
         };
         *slot += 1;
+        calls.proposed += 1;
     }
 }
 
@@ -423,6 +432,10 @@ pub struct Agent {
     board: Option<(crate::swarm::Board, usize, usize, String)>,
     /// Files a worker opened, so the lead can see what a swarm never looked at.
     opened: std::collections::BTreeSet<PathBuf>,
+    /// Each workspace file's digest as this agent last read or wrote it, by
+    /// relative path, so an edit never lands on a file it hasn't seen as it
+    /// is, and whether it has seen all of it, which an overwrite needs.
+    read_versions: BTreeMap<String, (String, bool)>,
     progress: Option<Arc<AtomicUsize>>,
 }
 
@@ -515,6 +528,7 @@ impl Agent {
             request_role: "lead",
             board: None,
             opened: Default::default(),
+            read_versions: BTreeMap::new(),
             progress: None,
         }
     }
@@ -671,6 +685,7 @@ impl Agent {
         self.archived = Vec::new();
         self.history = Vec::new();
         self.session_from = 0;
+        self.read_versions.clear();
         Ok(())
     }
 
@@ -723,7 +738,8 @@ impl Agent {
         s.push_str(
             "How to work:\n\
              - Look before you change. Find code with search, glob and outline; read only the ranges you need. \
-             Read a file before editing it.\n\
+             Read a file with read_file before editing it, and all of it before overwriting it; changes to \
+             unread or since-changed files are refused.\n\
              - Make the smallest change that fully solves the task, in the project's existing style.\n\
              - Verify with a build, the tests, or by running the code. Never claim something works without evidence.\n\
              - For multi-step work keep a short plan with the plan tool and update it as you go.\n",
@@ -1348,7 +1364,7 @@ impl Agent {
                 };
                 break;
             }
-            let mut early: Vec<Option<Result<String>>> = Vec::new();
+            let mut early: Vec<Option<Early>> = Vec::new();
             let mut read_to = 0;
             for (i, call) in reply.tool_calls.iter().enumerate() {
                 let mut mcp_outcome =
@@ -1650,7 +1666,7 @@ impl Agent {
     /// each result under its call. Everything else about those calls (the
     /// display, the permission check, redaction, history) still happens one
     /// call at a time, in order. Returns the index past the run.
-    fn read_ahead(&self, calls: &[ToolCall], at: usize, early: &mut Vec<Option<Result<String>>>) -> usize {
+    fn read_ahead(&self, calls: &[ToolCall], at: usize, early: &mut Vec<Option<Early>>) -> usize {
         // A lone read gains nothing from a thread.
         let read = |c: &ToolCall| tools::IN_PROCESS_READS.contains(&c.name.as_str());
         if !calls.get(at + 1).is_some_and(read) {
@@ -1662,12 +1678,19 @@ impl Agent {
             return at + 1;
         }
         let jobs: Vec<(&str, &Value)> = run.iter().map(|(name, args)| (*name, args)).collect();
+        let before: Vec<_> = jobs
+            .iter()
+            .map(|(name, args)| {
+                (*name == "read_file")
+                    .then(|| args["path"].as_str().and_then(|p| crate::inbox::file_version(&self.cwd, p)))
+                    .flatten()
+            })
+            .collect();
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(READ_AHEAD_THREADS);
         early.resize_with(calls.len(), || None);
-        for (slot, result) in
-            early[at..].iter_mut().zip(tools::read_ahead(&jobs, threads, &signal::interrupted_from_here()))
-        {
-            *slot = result;
+        let results = tools::read_ahead(&jobs, threads, &signal::interrupted_from_here());
+        for ((slot, result), before) in early[at..].iter_mut().zip(results).zip(before) {
+            *slot = result.map(|result| (result, before));
         }
         at + run.len()
     }
@@ -1701,7 +1724,7 @@ impl Agent {
 
     /// `early` is the call's result when it already ran ahead; it is used
     /// only once the call is authorized like any other.
-    fn dispatch(&mut self, call: &ToolCall, d: &mut Display, early: Option<Result<String>>) -> DispatchResult {
+    fn dispatch(&mut self, call: &ToolCall, d: &mut Display, early: Option<Early>) -> DispatchResult {
         self.tool_calls_run += 1;
         if self.shell_only && !Self::SHELL_TOOLS.contains(&call.name.as_str()) {
             return DispatchResult::failed(format!("error: unknown tool `{}`; this run offers only bash", call.name));
@@ -1853,13 +1876,16 @@ impl Agent {
     }
 
     /// Runs a filesystem/shell tool through the permission policy.
-    fn run_guarded(
-        &mut self,
-        name: &str,
-        args: &Value,
-        d: &mut Display,
-        early: Option<Result<String>>,
-    ) -> Result<String> {
+    fn run_guarded(&mut self, name: &str, args: &Value, d: &mut Display, early: Option<Early>) -> Result<String> {
+        // After a deny, which a read can't change, and before any prompt, so
+        // nobody approves a change that fails.
+        if matches!(name, "edit_file" | "write_file")
+            && !matches!(self.backend.decide(name, args, &self.policy, &self.cwd), Ok(Verdict::Deny(_)))
+        {
+            if let Err(e) = self.check_read(name, args) {
+                return Err(refusal_error(RefusalKind::ReadFirst, e.to_string()));
+            }
+        }
         let approval = match self.authorize(name, args, d)? {
             Authorization::Allowed(approval) => approval,
             Authorization::Refused { kind, message } => return Err(refusal_error(kind, message)),
@@ -1867,27 +1893,85 @@ impl Agent {
         if name == "bash" {
             return self.run_bash(args, &approval, d);
         }
-        let observed = if self.side_meta.is_some() && matches!(name, "read_file" | "outline") {
-            args["path"].as_str().and_then(|p| crate::inbox::file_version(&self.cwd, p))
-        } else {
-            None
-        };
-        let result = match early {
-            Some(result) => result,
-            None => self.backend.execute(name, args, &self.policy, &approval),
+        let local = self.backend.name() == "local";
+        let (result, observed) = match early {
+            Some(early) => early,
+            None => {
+                let observed = if (self.side_meta.is_some() && matches!(name, "read_file" | "outline"))
+                    || (local && name == "read_file")
+                {
+                    args["path"].as_str().and_then(|p| crate::inbox::file_version(&self.cwd, p))
+                } else {
+                    None
+                };
+                (self.backend.execute(name, args, &self.policy, &approval), observed)
+            }
         };
         if result.is_ok() {
             if let Some((path, hash)) = observed {
+                // A read counts only when the file was the same after it as before.
+                let after = crate::inbox::file_contents(&self.cwd, &path)
+                    .filter(|(_, bytes)| crate::inbox::digest(bytes) == hash);
+                let unchanged = after.is_some();
                 if let Some(meta) = &mut self.side_meta {
-                    if crate::inbox::file_version(&self.cwd, &path).as_ref().is_some_and(|(_, after)| after == &hash) {
-                        meta.observations.insert(path, hash);
+                    if unchanged {
+                        meta.observations.insert(path.clone(), hash.clone());
                     } else {
                         meta.observations.remove(&path);
                     }
                 }
+                if name == "read_file" {
+                    match after {
+                        Some((_, bytes)) => {
+                            // A part of a file already seen whole leaves it seen whole.
+                            let whole = tools::read_shows_all(args, &String::from_utf8_lossy(&bytes))
+                                || self.read_versions.get(&path).is_some_and(|(seen, whole)| *whole && *seen == hash);
+                            self.read_versions.insert(path, (hash, whole));
+                        }
+                        None => {
+                            self.read_versions.remove(&path);
+                        }
+                    }
+                }
+            } else if local && matches!(name, "edit_file" | "write_file") {
+                // The agent knows what it just wrote; the next edit needs no
+                // re-read. A write is the whole file; an edit keeps what was seen.
+                if let Some((path, hash)) = args["path"].as_str().and_then(|p| crate::inbox::file_version(&self.cwd, p))
+                {
+                    let whole = name == "write_file" || self.read_versions.get(&path).is_some_and(|(_, whole)| *whole);
+                    self.read_versions.insert(path, (hash, whole));
+                }
             }
         }
         result
+    }
+
+    /// Refuses an edit, or an overwrite of an existing file, that the agent
+    /// hasn't read with read_file, or that changed since it last read or
+    /// wrote it, whoever changed it. An overwrite also needs the whole file
+    /// read, or written by the agent; a part is enough for edit_file, whose
+    /// old_string must match exactly anyway. A new file is always fine. Only
+    /// a local workspace file small enough to hash is checked.
+    fn check_read(&self, name: &str, args: &Value) -> Result<()> {
+        if self.backend.name() != "local" {
+            return Ok(());
+        }
+        let Some(path) = args["path"].as_str() else { return Ok(()) };
+        let Some((relative, now)) = crate::inbox::file_version(&self.cwd, path) else { return Ok(()) };
+        match self.read_versions.get(&relative) {
+            None => bail!("{path} has not been read yet. Read it with read_file first, then make the change."),
+            Some((seen, _)) if *seen != now => {
+                bail!(
+                    "{path} changed since you last read it; a command you ran, a formatter or the user may have \
+                     changed it. Read it again with read_file, then retry."
+                )
+            }
+            Some((_, false)) if name == "write_file" => bail!(
+                "only part of {path} has been read. Read all of it with read_file (no offset, a limit past its last \
+                 line) before overwriting it, or change it with edit_file."
+            ),
+            Some(_) => Ok(()),
+        }
     }
 
     fn run_activity(&mut self, name: &str, args: &Value, d: &mut Display) -> Result<String> {
@@ -3082,6 +3166,8 @@ impl Agent {
         block.push_str(&format!("{}\n{carried}", context::USER_MESSAGES_HEADER));
         self.archived.append(&mut self.history);
         self.history = vec![json!({"role": "user", "content": block})];
+        // What the model read went with the summarised turns.
+        self.read_versions.clear();
         self.meter.forget_last();
         // Keep user/assistant alternation when the kept tail starts with a user turn.
         if tail.first().is_some_and(|m| m["role"] == "user") {
@@ -3799,7 +3885,7 @@ fn checker_gist(report: &str) -> Option<String> {
 mod read_ahead_tests {
     use super::*;
 
-    fn agent(cwd: PathBuf, mode: Mode) -> Agent {
+    pub(super) fn agent(cwd: PathBuf, mode: Mode) -> Agent {
         let endpoint = crate::llm::Endpoint::new(
             crate::config::Provider::Compatible,
             "http://127.0.0.1:1/v1".into(),
@@ -3809,7 +3895,7 @@ mod read_ahead_tests {
         Agent::new(client, "test-model".into(), cwd, Policy::new(mode))
     }
 
-    fn call(name: &str, args: Value) -> ToolCall {
+    pub(super) fn call(name: &str, args: Value) -> ToolCall {
         ToolCall { id: format!("id-{name}"), name: name.into(), arguments: args.to_string() }
     }
 
@@ -3858,14 +3944,180 @@ mod read_ahead_tests {
         let write = call("write_file", json!({"path": file.display().to_string(), "content": "two\n"}));
         let calls = [read.clone(), read.clone(), write, read.clone(), read];
         let a = agent(dir.clone(), Mode::Yolo);
-        let mut early: Vec<Option<Result<String>>> = calls.iter().map(|_| None).collect();
+        let mut early: Vec<Option<Early>> = calls.iter().map(|_| None).collect();
         assert_eq!(a.read_ahead(&calls, 0, &mut early), 2);
-        assert!(early[0].as_ref().is_some_and(|r| r.as_ref().unwrap().contains("one")));
+        assert!(early[0].as_ref().is_some_and(|(r, _)| r.as_ref().unwrap().contains("one")));
         assert!(early[1].is_some() && early[2..].iter().all(Option::is_none), "nothing past the write ran");
         // A lone read, or the last call, runs in place.
         assert_eq!(a.read_ahead(&calls, 2, &mut early), 3);
         assert_eq!(a.read_ahead(&calls[..4], 3, &mut early), 4);
         assert!(early[2..].iter().all(Option::is_none));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod read_first_tests {
+    use super::read_ahead_tests::{agent, call};
+    use super::*;
+
+    fn run(a: &mut Agent, name: &str, args: Value) -> DispatchResult {
+        a.dispatch(&call(name, args), &mut Display::new(true), None)
+    }
+
+    #[test]
+    fn edits_need_a_read_of_the_file_as_it_is_now() {
+        let dir = std::env::temp_dir().join(format!("rusty-agent-read-first-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "one\n").unwrap();
+        let path = file.display().to_string();
+        let edit = |from: &str, to: &str| json!({"path": path, "old_string": from, "new_string": to});
+        let mut a = agent(dir.clone(), Mode::Yolo);
+
+        let refused = run(&mut a, "edit_file", edit("one", "two"));
+        assert!(refused.text.contains("has not been read yet"), "{}", refused.text);
+        assert_eq!(refused.refusal, Some(RefusalKind::ReadFirst), "neither executed nor a change");
+        assert!(refused.text.starts_with("error: "), "{}", refused.text);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\n");
+
+        // Any read counts, and another spelling of the path is the same file.
+        assert!(!run(&mut a, "read_file", json!({"path": path, "limit": 1})).text.starts_with("error"));
+        let dotted = dir.join("./a.txt").display().to_string();
+        assert!(run(&mut a, "edit_file", json!({"path": dotted, "old_string": "one", "new_string": "two"}))
+            .text
+            .starts_with("edited"));
+        // Its own change needs no re-read.
+        assert!(run(&mut a, "edit_file", edit("two", "three")).text.starts_with("edited"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "three\n");
+
+        // A command it ran changed it: the message must not blame someone else.
+        let sed = format!("printf 'four\\n' > '{path}'");
+        assert!(run(&mut a, "bash", json!({"command": sed})).text.starts_with("exit code: 0"));
+        let stale = run(&mut a, "edit_file", edit("four", "five"));
+        assert!(stale.text.contains("changed since you last read it; a command you ran"), "{}", stale.text);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "four\n");
+        // So did the user.
+        run(&mut a, "read_file", json!({"path": path}));
+        std::fs::write(&file, "four\n\n").unwrap();
+        assert!(run(&mut a, "edit_file", edit("four", "five")).text.contains("changed since you last read it"));
+        run(&mut a, "read_file", json!({"path": path}));
+        assert!(run(&mut a, "edit_file", edit("four", "five")).text.starts_with("edited"));
+
+        // A deny comes first: reading wouldn't help, so the model isn't told to.
+        let mut denied = agent(dir.clone(), Mode::Yolo);
+        denied.policy.deny.push("edit_file".into());
+        let mut read_only = agent(dir.clone(), Mode::ReadOnly);
+        for a in [&mut denied, &mut read_only] {
+            let result = run(a, "edit_file", edit("five", "six"));
+            assert_eq!(result.refusal, Some(RefusalKind::Denied), "{}", result.text);
+            assert!(result.text.contains("denied by permissions"), "{}", result.text);
+        }
+        // Without a deny the read check still comes before any prompt.
+        let ask = run(&mut agent(dir.clone(), Mode::Ask), "edit_file", edit("five", "six"));
+        assert_eq!(ask.refusal, Some(RefusalKind::ReadFirst), "{}", ask.text);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clearing_the_conversation_forgets_what_was_read() {
+        let dir = std::env::temp_dir().join(format!("rusty-agent-read-clear-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "one\n").unwrap();
+        let path = file.display().to_string();
+        let mut a = agent(dir.clone(), Mode::Yolo);
+        run(&mut a, "read_file", json!({"path": path}));
+        a.clear().unwrap();
+        let result = run(&mut a, "edit_file", json!({"path": path, "old_string": "one", "new_string": "two"}));
+        assert!(result.text.contains("has not been read yet"), "{}", result.text);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_read_first_refusal_is_no_safety_outcome() {
+        let mut safety = Safety::default();
+        let risky = crate::permissions::Class::Risky("writes .env".into());
+        safety.record(&risky, Some(RefusalKind::ReadFirst));
+        assert_eq!((safety.risky.proposed, safety.risky.executed), (0, 0));
+        safety.record(&risky, None);
+        assert_eq!((safety.risky.proposed, safety.risky.executed), (1, 1));
+    }
+
+    #[test]
+    fn a_read_that_ran_ahead_counts_only_if_the_file_held_still() {
+        let dir = std::env::temp_dir().join(format!("rusty-agent-read-early-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        let path = file.display().to_string();
+        let edit = json!({"path": path, "old_string": "one", "new_string": "two"});
+        let reads = [call("read_file", json!({"path": path})), call("read_file", json!({"path": path}))];
+        for change in [false, true] {
+            std::fs::write(&file, "one\n").unwrap();
+            let mut a = agent(dir.clone(), Mode::Yolo);
+            let mut early = Vec::new();
+            assert_eq!(a.read_ahead(&reads, 0, &mut early), 2);
+            assert!(early[0].as_ref().is_some_and(|(_, before)| before.is_some()), "the version before the read");
+            if change {
+                // Changed after the read ran but before its turn to be dispatched.
+                std::fs::write(&file, "one\none\n").unwrap();
+            }
+            for (i, read) in reads.iter().enumerate() {
+                a.dispatch(read, &mut Display::new(true), early[i].take());
+            }
+            let result = run(&mut a, "edit_file", edit.clone());
+            assert_eq!(result.text.contains("has not been read yet"), change, "{}", result.text);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_file_creates_freely_but_overwrites_only_what_it_read() {
+        let dir = std::env::temp_dir().join(format!("rusty-agent-write-first-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fresh = dir.join("new.txt").display().to_string();
+        let old = dir.join("old.txt");
+        std::fs::write(&old, "keep\n").unwrap();
+        let old = old.display().to_string();
+        let mut a = agent(dir.clone(), Mode::Yolo);
+
+        assert!(run(&mut a, "write_file", json!({"path": fresh, "content": "hi\n"})).text.starts_with("wrote"));
+        assert!(run(&mut a, "write_file", json!({"path": fresh, "content": "again\n"})).text.starts_with("wrote"));
+
+        let refused = run(&mut a, "write_file", json!({"path": old, "content": "gone\n"}));
+        assert!(refused.text.contains("has not been read yet"), "{}", refused.text);
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "keep\n");
+        run(&mut a, "read_file", json!({"path": old}));
+        assert!(run(&mut a, "write_file", json!({"path": old, "content": "gone\n"})).text.starts_with("wrote"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_overwrite_needs_the_whole_file_but_an_edit_does_not() {
+        let dir = std::env::temp_dir().join(format!("rusty-agent-read-whole-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+        let path = file.display().to_string();
+        let write = json!({"path": path, "content": "new\n"});
+        let mut a = agent(dir.clone(), Mode::Yolo);
+
+        run(&mut a, "read_file", json!({"path": path, "limit": 1}));
+        let partial = run(&mut a, "write_file", write.clone());
+        assert!(partial.text.contains("only part of"), "{}", partial.text);
+        assert_eq!(partial.refusal, Some(RefusalKind::ReadFirst));
+        run(&mut a, "read_file", json!({"path": path, "offset": 2}));
+        assert!(run(&mut a, "write_file", write.clone()).text.contains("only part of"), "two parts aren't a read");
+        // A part is enough to edit, and the edit leaves the file partly seen.
+        let edit = json!({"path": path, "old_string": "one", "new_string": "uno"});
+        assert!(run(&mut a, "edit_file", edit).text.starts_with("edited"));
+        assert!(run(&mut a, "write_file", write.clone()).text.contains("only part of"));
+
+        run(&mut a, "read_file", json!({"path": path}));
+        // A later part of a file already seen whole doesn't undo that.
+        run(&mut a, "read_file", json!({"path": path, "offset": 3}));
+        assert!(run(&mut a, "write_file", write).text.starts_with("wrote"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
