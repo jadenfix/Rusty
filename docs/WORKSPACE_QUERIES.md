@@ -23,9 +23,16 @@ observed by that scan. No snapshot identity or persisted freshness is claimed.
 ## Matching and visibility
 
 Search invokes ripgrep on every request with smart case, line numbers, and
-optional glob/context arguments (context is clamped to ten lines). It retains
-ripgrep's default hidden, binary, and ignore rules, including explicit glob
-overrides. Descendant symlinks are not followed. Ambient config is disabled.
+optional glob/context arguments (context is clamped to ten lines).
+`output_mode` picks what comes back: `content` (matching lines, the default),
+`files_with_matches` (only the names of matching files, most recently modified
+first) or `count` (matches per file, sorted by path, then the total; when the
+capture was cut off the total is labelled partial). The two shorter modes have
+no per-file match or column cap, so they skip the streaming audit described
+below; a clean ripgrep exit with no diagnostics is a complete scan. Every mode
+retains ripgrep's default hidden, binary, and ignore rules, including explicit
+glob overrides. Descendant symlinks are not followed. Ambient config is
+disabled.
 
 Ripgrep keeps its parallel traversal: no `--sort path` is requested. Only the
 retained prefix is sorted by path and numeric line number. When the byte cap is
@@ -61,10 +68,22 @@ response also has a 30,000-byte cap, preserving its completeness header and
 bounded diagnostics and setting `output_truncated=true` when clipped. Outlines
 retain at most 160 bytes from each definition signature.
 
-Only failure to find the ripgrep executable selects grep. The legacy grep
-fallback uses case-insensitive extended regex and build-directory exclusions;
-it cannot promise ripgrep ignore, glob, or regex parity. Its results always say
-`scan_complete=false`, including when grep exits successfully or finds nothing.
+Only failure to find the ripgrep executable selects a fallback. When the search
+path is a directory inside the git work tree around the current directory, it
+is `git grep --untracked`, which searches tracked and untracked files and
+leaves `.gitignore`'d ones out, as ripgrep would. A `-g` glob becomes a
+`:(glob)` pathspec under the search path, with ripgrep's rules: no slash
+matches a name at any depth, `{a,b}` is expanded, and `!glob` excludes. Names
+arrive NUL-delimited, except in line output with context, where `-z` would
+hide which lines are context; there quoting is off (`core.quotePath=false`)
+so non-ASCII names come back as they are. Its `count` is matching lines, not
+matches, and says so. Otherwise, or when git
+is missing or refuses the repository (exit 128), it is grep with
+build-directory exclusions and no ignore rules. Both use extended regex with
+ripgrep's smart case: a pattern with no upper case ignores case. Neither can
+promise ripgrep's hidden-file, glob or regex parity, so their results always
+say `scan_complete=false`, including when they exit successfully or find
+nothing.
 An invalid regex, unreadable path, or failed ripgrep process never becomes a
 complete empty result.
 
@@ -83,13 +102,24 @@ search incomplete. Only `termination=exited` can report complete. OS scheduling
 and uninterruptible kernel operations prevent a hard real-time guarantee.
 Non-Unix search fails before spawning until bounded pipe support is implemented.
 
-Glob and outline retain their separate existing policy: include hidden files,
-do not apply ignore files, and exclude `.git`, `target`, `node_modules`, `.venv`,
-`venv`, `__pycache__`, `dist`, `build`, and `.next` directory names. Globs retain
-the tool's `*`, `?`, `**` matcher. A basename-only pattern matches basenames;
-a pattern with `/` matches relative paths. No approximate candidate filter is
-used. Descendant directory symlinks are reported as skipped rather than
-followed into cycles. Regular-file symlinks are read normally.
+Glob and outline include hidden files and exclude `.git`, `target`,
+`node_modules`, `.venv`, `venv`, `__pycache__`, `dist`, `build`, and `.next`
+directory names. Inside a git repository they also leave out what `.gitignore`
+files ignore, read in process (glob runs on read-ahead threads, which must not
+start a process): each file's rules are relative to its directory, rules in
+directories above the search root count, a later rule overrides an earlier one,
+`!` re-includes, a trailing `/` matches only directories, and `[...]` classes
+(with `!`/`^` negation and ranges) work as in git. `.git/info/exclude` is read
+once, from the repository's top, and ranks below every `.gitignore`; global
+excludes, which need git's configuration, are not. A directory inside the root
+with its own `.git` (a nested repository, submodule or worktree) is not
+entered, as git does not. Outside a repository no ignore files apply, and the
+result's scope says so. Glob lists matches most recently modified first, then
+by path. Globs retain the tool's `*`, `?`, `**` matcher. A basename-only
+pattern matches basenames; a pattern with `/` matches relative paths. No
+approximate candidate filter is used. Descendant directory symlinks are
+reported as skipped rather than followed into cycles. Regular-file symlinks are
+read normally.
 
 Enumeration is bounded to 20,000 visited entries and 128 directory levels.
 The global budget is charged during directory enumeration, bounding retained

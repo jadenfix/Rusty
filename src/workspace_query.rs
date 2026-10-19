@@ -246,9 +246,31 @@ fn collect_query(child: Child, timeout: Duration) -> Result<(Capture, Capture, O
     collect_query_cancellable(child, timeout, &|| false, None)
 }
 
+/// What a search reports: matching lines with optional context, only the
+/// names of the files that match, or how many matches each file has.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    #[default]
+    Content,
+    Files,
+    Count,
+}
+
+impl Mode {
+    pub fn parse(name: Option<&str>) -> Result<Self> {
+        match name.unwrap_or("") {
+            "" | "content" => Ok(Self::Content),
+            "files_with_matches" => Ok(Self::Files),
+            "count" => Ok(Self::Count),
+            other => anyhow::bail!("unknown output_mode `{other}`; use content, files_with_matches or count"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SearchResult {
     pub engine: &'static str,
+    pub mode: Mode,
     pub scan_complete: bool,
     pub audit_complete: bool,
     pub match_limit_possible: bool,
@@ -265,10 +287,12 @@ impl SearchResult {
             "[query engine={} scan_complete={} output_truncated={} freshness=live_observation cache=none retrieval_only=true exit={:?} termination={}]\n",
             self.engine, self.scan_complete, self.output.truncated, self.exit_code, self.termination
         );
-        let scope = if self.engine == "rg" {
-            format!("[scope: ripgrep default ignore/hidden/binary rules with explicit glob overrides, smart case; max_count={MATCHES_PER_FILE} max_columns={MAX_COLUMNS} audit_complete={} match_limit_possible={} column_limit_possible={}; sorted retained records, not a stable truncated subset or atomic snapshot]\n", self.audit_complete, self.match_limit_possible, self.column_limit_possible)
-        } else {
-            "[scope: grep fallback; case-insensitive ERE, build directories excluded; ripgrep ignore/glob/regex parity unavailable]\n".into()
+        let scope = match (self.engine, self.mode) {
+            ("rg", Mode::Content) => format!("[scope: ripgrep default ignore/hidden/binary rules with explicit glob overrides, smart case; max_count={MATCHES_PER_FILE} max_columns={MAX_COLUMNS} audit_complete={} match_limit_possible={} column_limit_possible={}; sorted retained records, not a stable truncated subset or atomic snapshot]\n", self.audit_complete, self.match_limit_possible, self.column_limit_possible),
+            ("rg", Mode::Files) => "[scope: ripgrep default ignore/hidden/binary rules with explicit glob overrides, smart case; names of matching files, most recently modified first]\n".into(),
+            ("rg", Mode::Count) => "[scope: ripgrep default ignore/hidden/binary rules with explicit glob overrides, smart case; matches per file, sorted by path]\n".into(),
+            ("git-grep", _) => "[scope: git grep fallback; tracked and untracked files with .gitignore applied, smart case ERE; ripgrep hidden/glob/regex parity unavailable]\n".into(),
+            _ => "[scope: grep fallback; smart case ERE, build directories excluded, ignore files not applied; ripgrep ignore/glob/regex parity unavailable]\n".into(),
         };
         let body = if self.output.text.trim().is_empty() {
             if self.scan_complete {
@@ -315,8 +339,8 @@ fn render_bounded(mut header: String, scope: &str, body: &str, diagnostics: &str
 
 /// Spawn rg directly each time: cached executable availability could outlive a PATH change.
 /// Only a missing executable selects fallback; a failed rg query must retain its diagnostics.
-pub fn search(pattern: &str, path: &str, glob: Option<&str>, context: u64) -> Result<SearchResult> {
-    search_cancellable(pattern, path, glob, context, || false)
+pub fn search(pattern: &str, path: &str, glob: Option<&str>, context: u64, mode: Mode) -> Result<SearchResult> {
+    search_cancellable(pattern, path, glob, context, mode, || false)
 }
 
 /// The caller owns cancellation; this layer creates no global state or polling threads.
@@ -325,9 +349,10 @@ pub fn search_cancellable(
     path: &str,
     glob: Option<&str>,
     context: u64,
+    mode: Mode,
     cancelled: impl Fn() -> bool,
 ) -> Result<SearchResult> {
-    search_with("rg", pattern, path, glob, context, &cancelled)
+    search_with("rg", pattern, path, glob, context, mode, &cancelled)
 }
 
 fn search_with(
@@ -336,11 +361,13 @@ fn search_with(
     path: &str,
     glob: Option<&str>,
     context: u64,
+    mode: Mode,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<SearchResult> {
     if cancelled() {
         return Ok(SearchResult {
             engine: "rg",
+            mode,
             scan_complete: false,
             audit_complete: false,
             match_limit_possible: false,
@@ -353,65 +380,56 @@ fn search_with(
     }
     let context = context.min(10).to_string();
     let mut rg = Command::new(program);
-    rg.args([
-        "--no-config",
-        "--line-number",
-        "--with-filename",
-        "--no-heading",
-        "--color",
-        "never",
-        "--smart-case",
-        "--null",
-        "--no-context-separator",
-        "--max-count",
-        "30",
-        "--max-columns",
-        "300",
-        "-C",
-        &context,
-    ]);
+    rg.args(["--no-config", "--color", "never", "--smart-case", "--null"]);
+    match mode {
+        Mode::Content => rg.args([
+            "--line-number",
+            "--with-filename",
+            "--no-heading",
+            "--no-context-separator",
+            "--max-count",
+            "30",
+            "--max-columns",
+            "300",
+            "-C",
+            &context,
+        ]),
+        Mode::Files => rg.arg("--files-with-matches"),
+        Mode::Count => rg.args(["--count-matches", "--with-filename"]),
+    };
     if let Some(g) = glob {
         rg.args(["-g", g]);
     }
-    rg.args(["-e", pattern, "--", path]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let (child, engine) = match spawn_query(&mut rg) {
-        Ok(child) => (child, "rg"),
+    rg.args(["-e", pattern, "--", path]);
+    let child = match spawn_query(&mut rg) {
+        Ok(child) => child,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut grep = Command::new("grep");
-            grep.args(["-rnEiIH", "-C", &context]);
-            for d in SKIP_DIRS {
-                grep.arg(format!("--exclude-dir={d}"));
-            }
-            if let Some(g) = glob {
-                grep.arg(format!("--include={g}"));
-            }
-            grep.args(["-e", pattern, "--", path]);
-            grep.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-            (spawn_query(&mut grep).context("cannot start grep fallback")?, "grep")
+            return fallback(pattern, path, glob, &context, mode, cancelled)
         }
         Err(e) => return Err(e).context("cannot start ripgrep"),
     };
+    // Only line output has per-file match and column limits to audit.
     let mut audit = RgAudit::new();
-    let (output, diagnostics, exit_code, termination) = collect_query_cancellable(
-        child,
-        QUERY_TIMEOUT,
-        cancelled,
-        if engine == "rg" { Some(&mut audit) } else { None },
-    )?;
+    let (output, diagnostics, exit_code, termination) =
+        collect_query_cancellable(child, QUERY_TIMEOUT, cancelled, (mode == Mode::Content).then_some(&mut audit))?;
     audit.complete &= audit.pending.is_empty();
-    let audit_complete = engine == "rg" && audit.complete;
+    let audit_complete = audit.complete;
     let match_limit_possible = audit.match_limit_possible;
     let column_limit_possible = audit.column_limit_possible;
-    let mut output = if engine == "rg" { present_rg(output) } else { output };
+    let mut output = match mode {
+        Mode::Content => present_rg(output),
+        Mode::Files => present_files(output, '\0'),
+        Mode::Count => present_counts(output, '\0', false),
+    };
     output.truncated |= match_limit_possible || column_limit_possible;
-    let scan_complete = engine == "rg"
-        && termination == "exited"
+    let scan_complete = termination == "exited"
         && matches!(exit_code, Some(0 | 1))
         && diagnostics.text.is_empty()
         && audit_complete
         && !match_limit_possible;
     Ok(SearchResult {
-        engine,
+        engine: "rg",
+        mode,
         scan_complete,
         audit_complete,
         match_limit_possible,
@@ -421,6 +439,238 @@ fn search_with(
         exit_code,
         termination,
     })
+}
+
+/// Without ripgrep: `git grep` inside the repository around the working
+/// directory, so ignored files stay out as they do with rg, else plain grep.
+/// Both use rg's smart case. Neither has rg's exact semantics, so neither
+/// reports a complete scan.
+fn fallback(
+    pattern: &str,
+    path: &str,
+    glob: Option<&str>,
+    context: &str,
+    mode: Mode,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<SearchResult> {
+    let ignore_case = !pattern.chars().any(char::is_uppercase);
+    let flags = |cmd: &mut Command| {
+        if ignore_case {
+            cmd.arg("-i");
+        }
+        match mode {
+            Mode::Content => cmd.args(["-n", "-C", context]),
+            Mode::Files => cmd.arg("-l"),
+            Mode::Count => cmd.arg("-c"),
+        };
+    };
+    if Path::new(path).is_dir() && in_cwd_repo(Path::new(path)) {
+        let mut git = Command::new("git");
+        // Pin the settings that change the output's shape.
+        git.args([
+            "-c",
+            "grep.fullName=false",
+            "-c",
+            "grep.column=false",
+            "-c",
+            "core.quotePath=false",
+            "grep",
+            "--no-color",
+            "--untracked",
+            "-I",
+            "-E",
+        ]);
+        flags(&mut git);
+        // A NUL after each name keeps any name intact. In line output it also
+        // replaces the `:`/`-` that tells a match from context, so with context
+        // the names come unquoted (quotePath off) but newline-delimited.
+        let nul = mode != Mode::Content || context == "0";
+        if nul {
+            git.arg("-z");
+        }
+        git.args(["-e", pattern, "--"]).args(pathspecs(path, glob));
+        match spawn_query(&mut git) {
+            Ok(child) => {
+                let (output, diagnostics, exit_code, termination) =
+                    collect_query_cancellable(child, QUERY_TIMEOUT, cancelled, None)?;
+                // 128 is git refusing to search at all, as in a repository it
+                // won't read; grep can still try.
+                if exit_code != Some(128) {
+                    let output = if nul && mode == Mode::Content { from_git_nul(output) } else { output };
+                    return Ok(unaudited("git-grep", mode, nul, output, diagnostics, exit_code, termination));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context("cannot start git grep fallback"),
+        }
+    }
+    let mut grep = Command::new("grep");
+    grep.arg("-rEIH");
+    flags(&mut grep);
+    for d in SKIP_DIRS {
+        grep.arg(format!("--exclude-dir={d}"));
+    }
+    if let Some(g) = glob {
+        grep.arg(format!("--include={g}"));
+    }
+    grep.args(["-e", pattern, "--", path]);
+    let child = spawn_query(&mut grep).context("cannot start grep fallback")?;
+    let (output, diagnostics, exit_code, termination) =
+        collect_query_cancellable(child, QUERY_TIMEOUT, cancelled, None)?;
+    Ok(unaudited("grep", mode, false, output, diagnostics, exit_code, termination))
+}
+
+/// git grep's `-z` line output, `path\0line\0text`, in the `path:line:text`
+/// form the other engines show.
+fn from_git_nul(raw: Capture) -> Capture {
+    let mut text = String::with_capacity(raw.text.len());
+    for line in raw.text.split_inclusive('\n') {
+        text.push_str(&line.replacen('\0', ":", 2));
+    }
+    Capture { text, truncated: raw.truncated }
+}
+
+/// `nul`: names in `output` end with a NUL rather than a newline or `:`.
+fn unaudited(
+    engine: &'static str,
+    mode: Mode,
+    nul: bool,
+    output: Capture,
+    diagnostics: Capture,
+    exit_code: Option<i32>,
+    termination: &'static str,
+) -> SearchResult {
+    // Both fallbacks' -c counts matching lines, not matches.
+    let output = match mode {
+        Mode::Content => output,
+        Mode::Files => present_files(output, if nul { '\0' } else { '\n' }),
+        Mode::Count => present_counts(output, if nul { '\0' } else { ':' }, true),
+    };
+    SearchResult {
+        engine,
+        mode,
+        scan_complete: false,
+        audit_complete: false,
+        match_limit_possible: false,
+        column_limit_possible: false,
+        output,
+        diagnostics,
+        exit_code,
+        termination,
+    }
+}
+
+/// `git grep` pathspecs for a search path and an rg-style glob. As with rg,
+/// the glob is relative to the path, a glob without a slash matches a name at
+/// any depth, `{a,b}` offers alternatives, and a leading `!` excludes.
+fn pathspecs(path: &str, glob: Option<&str>) -> Vec<String> {
+    let Some(glob) = glob else { return vec![path.to_string()] };
+    let (exclude, glob) = glob.strip_prefix('!').map_or((false, glob), |g| (true, g));
+    let base = path.trim_end_matches('/');
+    let magic = if exclude { ":(glob,exclude)" } else { ":(glob)" };
+    let mut specs: Vec<String> = alternatives(glob)
+        .into_iter()
+        .map(|g| {
+            let g = if g.contains('/') { g } else { format!("**/{g}") };
+            if base.is_empty() || base == "." {
+                format!("{magic}{g}")
+            } else {
+                format!("{magic}{base}/{g}")
+            }
+        })
+        .collect();
+    if exclude {
+        specs.insert(0, path.to_string());
+    }
+    specs
+}
+
+/// A glob's `{a,b}` groups expanded, which git's globs lack: `*.{rs,py}` is
+/// `*.rs` and `*.py`.
+fn alternatives(glob: &str) -> Vec<String> {
+    let Some(open) = glob.find('{') else { return vec![glob.to_string()] };
+    let Some(close) = glob[open..].find('}').map(|i| open + i) else { return vec![glob.to_string()] };
+    glob[open + 1..close]
+        .split(',')
+        .flat_map(|alt| alternatives(&format!("{}{alt}{}", &glob[..open], &glob[close + 1..])))
+        .collect()
+}
+
+/// The top of the git work tree holding `dir`, found by its `.git` entry.
+pub fn repo_root(dir: &Path) -> Option<&Path> {
+    dir.ancestors().find(|d| d.join(".git").exists())
+}
+
+/// Whether `path` lies in the work tree around the current directory, the
+/// one `git grep` searches when run from here.
+fn in_cwd_repo(path: &Path) -> bool {
+    let (Ok(cwd), Ok(target)) = (std::env::current_dir().and_then(|d| d.canonicalize()), path.canonicalize()) else {
+        return false;
+    };
+    repo_root(&cwd).is_some_and(|root| target.starts_with(root))
+}
+
+/// Matching file names, most recently modified first as `glob` lists them.
+/// A name cut off by the capture limit is dropped rather than shown half.
+fn present_files(raw: Capture, sep: char) -> Capture {
+    let mut names: Vec<&str> = raw.text.split(sep).collect();
+    if raw.truncated && !raw.text.ends_with(sep) {
+        names.pop();
+    }
+    let mut stamped: Vec<_> = names
+        .into_iter()
+        .filter(|n| !n.is_empty())
+        .map(|n| (fs::metadata(n).and_then(|m| m.modified()).ok(), n))
+        .collect();
+    stamped.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    let mut text = String::with_capacity(raw.text.len());
+    for (_, name) in stamped {
+        text.push_str(name);
+        text.push('\n');
+    }
+    Capture { text, truncated: raw.truncated }
+}
+
+/// `path:count` for each file with a match, sorted by path, then the total.
+/// `sep` divides a path from its count in the engine's output; `lines` says
+/// the engine counted matching lines rather than matches.
+fn present_counts(raw: Capture, sep: char, lines: bool) -> Capture {
+    let mut truncated = raw.truncated;
+    let mut rows: Vec<&str> = raw.text.lines().collect();
+    if raw.truncated && !raw.text.ends_with('\n') {
+        rows.pop();
+    }
+    let mut counts = Vec::with_capacity(rows.len());
+    for line in rows {
+        match line.rsplit_once(sep).and_then(|(path, n)| Some((path, n.parse::<u64>().ok()?))) {
+            // grep -c names every file it read, matching or not.
+            Some((_, 0)) => {}
+            Some(count) => counts.push(count),
+            None => truncated = true,
+        }
+    }
+    counts.sort_unstable();
+    let mut text = String::new();
+    for (path, n) in &counts {
+        let _ = writeln!(text, "{path}:{n}");
+    }
+    if !counts.is_empty() {
+        let total: u64 = counts.iter().map(|c| c.1).sum();
+        let unit = match (lines, total == 1) {
+            (true, true) => "matching line",
+            (true, false) => "matching lines",
+            (false, true) => "match",
+            (false, false) => "matches",
+        };
+        let files = format!("{} file{}", counts.len(), if counts.len() == 1 { "" } else { "s" });
+        // A cut-off capture only counted what it kept.
+        let _ = if truncated {
+            writeln!(text, "partial total: {total} {unit} in the {files} shown")
+        } else {
+            writeln!(text, "{total} {unit} in {files}")
+        };
+    }
+    Capture { text, truncated }
 }
 
 /// Audit every drained frame independently of the retained display prefix.
@@ -538,6 +788,8 @@ pub struct Enumeration {
     pub incomplete: bool,
     pub diagnostics: Vec<String>,
     pub skipped: usize,
+    /// The root is in a git repository, so `.gitignore` rules were applied.
+    pub ignores_applied: bool,
     visited: usize,
 }
 
@@ -563,7 +815,11 @@ impl Enumeration {
             "[query scan_complete={} output_truncated={} freshness=live_observation cache=none retrieval_only=true skipped={}]\n",
             !self.incomplete, output_truncated, self.skipped
         );
-        let scope = "[scope: build/dependency directories excluded; hidden files included; ignore files not applied; descendant directory symlinks skipped; not an atomic snapshot]\n";
+        let scope = if self.ignores_applied {
+            "[scope: build/dependency directories, .gitignore'd paths and nested repositories excluded; hidden files included; descendant directory symlinks skipped; not an atomic snapshot]\n"
+        } else {
+            "[scope: build/dependency directories excluded; hidden files included; ignore files not applied (not a git repository); descendant directory symlinks skipped; not an atomic snapshot]\n"
+        };
         let mut diagnostics = String::new();
         for diagnostic in &self.diagnostics {
             let _ = write!(diagnostics, "\n[skipped] {diagnostic}");
@@ -579,13 +835,104 @@ impl Enumeration {
     }
 }
 
+/// `.gitignore` rules as git applies them inside a repository: each file's
+/// rules are relative to its directory, a later match overrides an earlier
+/// one, and `!` re-includes. `.git/info/exclude` counts, below every
+/// `.gitignore`; global excludes would need git's configuration and are not
+/// read.
+#[derive(Default)]
+struct Ignores {
+    active: bool,
+    rules: Vec<IgnoreRule>,
+}
+
+struct IgnoreRule {
+    /// The directory the rule's file sits in, as the walk spells it.
+    base: PathBuf,
+    /// For a file above the walk's root: the root's path below that file's
+    /// directory, so anchored rules still match from where they were written.
+    above: String,
+    glob: String,
+    negate: bool,
+    dir_only: bool,
+    anchored: bool,
+}
+
+impl Ignores {
+    /// One ignore file's rules, after (so overriding) those already loaded.
+    fn load(&mut self, file: &Path, base: &Path, above: &str) {
+        let Ok(text) = fs::read_to_string(file) else { return };
+        for line in text.lines().map(str::trim_end) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (negate, line) = line.strip_prefix('!').map_or((false, line), |l| (true, l));
+            let line = line.strip_prefix('\\').unwrap_or(line);
+            let (dir_only, line) = line.strip_suffix('/').map_or((false, line), |l| (true, l));
+            // A slash anywhere but the end ties the rule to its directory.
+            let anchored = line.contains('/');
+            let glob = line.trim_start_matches('/');
+            if !glob.is_empty() {
+                self.rules.push(IgnoreRule {
+                    base: base.to_path_buf(),
+                    above: above.to_string(),
+                    glob: glob.to_string(),
+                    negate,
+                    dir_only,
+                    anchored,
+                });
+            }
+        }
+    }
+
+    fn ignored(&self, path: &Path, is_dir: bool) -> bool {
+        let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+        let mut ignored = false;
+        for rule in &self.rules {
+            // Only an ignoring rule can ignore, and only a `!` rule re-include.
+            if ignored != rule.negate || (rule.dir_only && !is_dir) {
+                continue;
+            }
+            let hit = if rule.anchored {
+                path.strip_prefix(&rule.base).is_ok_and(|rel| {
+                    let rel = rel.to_string_lossy();
+                    let rel = if rule.above.is_empty() { rel.into_owned() } else { format!("{}/{rel}", rule.above) };
+                    wildcard(rule.glob.as_bytes(), rel.as_bytes())
+                })
+            } else {
+                wildcard(rule.glob.as_bytes(), name.as_bytes())
+            };
+            if hit {
+                ignored = !rule.negate;
+            }
+        }
+        ignored
+    }
+}
+
 pub fn files_under(root: &Path) -> Enumeration {
     let mut scan = Enumeration::default();
-    enumerate(root, 0, ENTRY_LIMIT, &mut scan);
+    let mut ignores = Ignores::default();
+    if let Ok(canonical) = root.canonicalize() {
+        if let Some(top) = repo_root(&canonical) {
+            ignores.active = true;
+            let below = |dir: &Path| canonical.strip_prefix(dir).unwrap_or(&canonical).to_string_lossy().into_owned();
+            // .git/info/exclude ranks below every .gitignore, so it goes first.
+            ignores.load(&top.join(".git").join("info").join("exclude"), root, &below(top));
+            // Then the directories from the repository's top down to the root.
+            let mut above: Vec<&Path> = canonical.ancestors().skip(1).take_while(|d| d.starts_with(top)).collect();
+            above.reverse();
+            for dir in above {
+                ignores.load(&dir.join(".gitignore"), root, &below(dir));
+            }
+        }
+    }
+    scan.ignores_applied = ignores.active;
+    enumerate(root, 0, ENTRY_LIMIT, &mut scan, &mut ignores);
     scan
 }
 
-fn enumerate(dir: &Path, depth: usize, limit: usize, scan: &mut Enumeration) {
+fn enumerate(dir: &Path, depth: usize, limit: usize, scan: &mut Enumeration, ignores: &mut Ignores) {
     if depth >= 128 || scan.visited >= limit {
         scan.skip(dir, "enumeration budget reached; subtree not scanned");
         return;
@@ -611,6 +958,11 @@ fn enumerate(dir: &Path, depth: usize, limit: usize, scan: &mut Enumeration) {
         }
     }
     items.sort_by_key(|e| e.file_name());
+    // This directory's rules hold for everything beneath it, and no further.
+    let inherited = ignores.rules.len();
+    if ignores.active {
+        ignores.load(&dir.join(".gitignore"), dir, "");
+    }
     for entry in items {
         let path = entry.path();
         let metadata = match fs::metadata(&path) {
@@ -620,13 +972,21 @@ fn enumerate(dir: &Path, depth: usize, limit: usize, scan: &mut Enumeration) {
                 continue;
             }
         };
+        if ignores.ignored(&path, metadata.is_dir()) {
+            continue;
+        }
         if metadata.is_dir() {
             if SKIP_DIRS.iter().any(|d| entry.file_name() == *d) {
                 continue;
             }
+            // A nested repository or worktree is its own project, as git sees
+            // it, and usually a second copy of files already listed.
+            if ignores.active && path.join(".git").exists() {
+                continue;
+            }
             match entry.file_type() {
                 Ok(t) if t.is_symlink() => scan.skip(&path, "directory symlink not followed"),
-                Ok(_) => enumerate(&path, depth + 1, limit, scan),
+                Ok(_) => enumerate(&path, depth + 1, limit, scan, ignores),
                 Err(e) => scan.skip(&path, e),
             }
         } else if metadata.is_file() {
@@ -635,6 +995,63 @@ fn enumerate(dir: &Path, depth: usize, limit: usize, scan: &mut Enumeration) {
             scan.skip(&path, "not a regular file");
         }
     }
+    ignores.rules.truncate(inherited);
+}
+
+/// Glob matching: `*` and `?` stay within one path segment, `**` crosses them.
+pub fn wildcard(p: &[u8], s: &[u8]) -> bool {
+    if p.starts_with(b"**/") {
+        return (0..=s.len()).any(|i| (i == 0 || s[i - 1] == b'/') && wildcard(&p[3..], &s[i..]));
+    }
+    if p.starts_with(b"**") {
+        return (0..=s.len()).any(|i| wildcard(&p[2..], &s[i..]));
+    }
+    match p.first() {
+        None => s.is_empty(),
+        Some(b'*') => {
+            for i in 0..=s.len() {
+                if wildcard(&p[1..], &s[i..]) {
+                    return true;
+                }
+                if i < s.len() && s[i] == b'/' {
+                    break;
+                }
+            }
+            false
+        }
+        Some(b'?') => !s.is_empty() && s[0] != b'/' && wildcard(&p[1..], &s[1..]),
+        Some(b'[') => match class(&p[1..], s.first().copied()) {
+            Some((hit, rest)) => hit && wildcard(rest, &s[1..]),
+            // A class that never closes is a literal `[`.
+            None => s.first() == Some(&b'[') && wildcard(&p[1..], &s[1..]),
+        },
+        Some(c) => s.first() == Some(c) && wildcard(&p[1..], &s[1..]),
+    }
+}
+
+/// A `[...]` class, given the pattern just past its `[`: whether `c` is in it
+/// (never `/`), and the pattern after its `]`. `!` or `^` first negates, `a-z`
+/// is a range, and a `]` first is a member. None when the class never closes.
+fn class(p: &[u8], c: Option<u8>) -> Option<(bool, &[u8])> {
+    let (negated, body) = match p.first() {
+        Some(b'!' | b'^') => (true, &p[1..]),
+        _ => (false, p),
+    };
+    let end = 1 + body.get(1..)?.iter().position(|&b| b == b']')?;
+    let (set, rest) = (&body[..end], &body[end + 1..]);
+    let Some(c) = c.filter(|&c| c != b'/') else { return Some((false, rest)) };
+    let mut found = false;
+    let mut i = 0;
+    while i < set.len() {
+        if i + 2 < set.len() && set[i + 1] == b'-' {
+            found |= (set[i]..=set[i + 2]).contains(&c);
+            i += 3;
+        } else {
+            found |= set[i] == c;
+            i += 1;
+        }
+    }
+    Some((found != negated, rest))
 }
 
 #[cfg(test)]
@@ -657,6 +1074,7 @@ mod tests {
         assert_eq!(output.text.len(), 40);
         let result = SearchResult {
             engine: "rg",
+            mode: Mode::Content,
             scan_complete: true,
             audit_complete: true,
             match_limit_possible: false,
@@ -737,6 +1155,7 @@ mod tests {
     fn rendered_bound_retains_completeness_flags_and_diagnostics() {
         let result = SearchResult {
             engine: "rg",
+            mode: Mode::Content,
             scan_complete: false,
             audit_complete: true,
             match_limit_possible: false,
@@ -776,7 +1195,7 @@ printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
         )
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-        let result = search_with(script.to_str().unwrap(), "needle", ".", None, 0, &|| false);
+        let result = search_with(script.to_str().unwrap(), "needle", ".", None, 0, Mode::Content, &|| false);
         fs::remove_dir_all(dir).unwrap();
         let result = result.unwrap();
         assert_eq!(result.exit_code, Some(0));
@@ -807,6 +1226,7 @@ printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
     fn partial_matches_keep_diagnostics_and_never_claim_complete() {
         let result = SearchResult {
             engine: "rg",
+            mode: Mode::Content,
             scan_complete: false,
             audit_complete: false,
             match_limit_possible: false,
@@ -824,13 +1244,16 @@ printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
 
     #[test]
     fn missing_rg_falls_back_without_claiming_semantic_parity() {
-        let result =
-            search_with("/rusty/nonexistent-rg", &"pub fn search".to_uppercase(), file!(), None, 0, &|| false).unwrap();
+        let missing = "/rusty/nonexistent-rg";
+        let result = search_with(missing, "PUB fn search", file!(), None, 0, Mode::Content, &|| false).unwrap();
         assert_eq!(result.engine, "grep");
         assert!(!result.scan_complete);
-        assert!(!result.output.text.is_empty());
         assert!(result.render().contains("parity unavailable"));
-        let empty = search_with("/rusty/nonexistent-rg", "a^", file!(), None, 0, &|| false).unwrap();
+        // Smart case, as with rg: lower case matches any case, upper case is exact.
+        let any_case = search_with(missing, "pub fn search", file!(), None, 0, Mode::Content, &|| false).unwrap();
+        assert!(!any_case.output.text.is_empty());
+        let exact = &"pub fn search".to_uppercase();
+        let empty = search_with(missing, exact, file!(), None, 0, Mode::Content, &|| false).unwrap();
         assert!(empty.render().contains("no matches observed; search incomplete"));
     }
 
@@ -851,6 +1274,7 @@ printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
         assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
         let result = SearchResult {
             engine: "rg",
+            mode: Mode::Content,
             scan_complete: false,
             audit_complete: false,
             match_limit_possible: false,
@@ -867,7 +1291,7 @@ printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
     #[test]
     #[cfg(unix)]
     fn caller_cancellation_reaps_the_owned_child() {
-        let before = search_with("/rusty/nonexistent-rg", "needle", ".", None, 0, &|| true).unwrap();
+        let before = search_with("/rusty/nonexistent-rg", "needle", ".", None, 0, Mode::Content, &|| true).unwrap();
         assert_eq!(before.termination, "cancelled");
         assert!(!before.scan_complete && before.output.text.is_empty());
         let mut cmd = Command::new("sh");
@@ -1005,10 +1429,182 @@ os._exit(0)
             fs::write(dir.join(format!("{i}.rs")), "").unwrap();
         }
         let mut scan = Enumeration::default();
-        enumerate(&dir, 0, 2, &mut scan);
+        enumerate(&dir, 0, 2, &mut scan, &mut Ignores::default());
         assert_eq!(scan.files.len(), 2);
         assert!(scan.incomplete && scan.skipped > 0);
         assert!(scan.render("no files observed", false).contains("remaining entries not scanned"));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn enumeration_applies_gitignore_rules_inside_a_repository() {
+        let root = std::env::temp_dir().join(format!("rusty-enumeration-ignores-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for dir in [".git/info", "build-out", "src/build-out", "sub", "other", "nested/.git"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let files = [
+            (".gitignore", "# comment\n*.log\n!keep.log\n/build-out/\nsub/deep.txt\n*.py[cod]\n!kept.tmp\n"),
+            // Every .gitignore outranks info/exclude, whatever the order read.
+            (".git/info/exclude", "secret.txt\n*.tmp\n"),
+            ("x.pyc", ""),
+            ("x.py", ""),
+            ("dropped.tmp", ""),
+            ("kept.tmp", ""),
+            ("sub/.gitignore", "local.rs\n"),
+            ("a.log", ""),
+            ("keep.log", ""),
+            ("secret.txt", ""),
+            ("build-out/x.rs", ""),
+            ("src/build-out/y.rs", ""),
+            ("sub/deep.txt", ""),
+            ("sub/local.rs", ""),
+            ("sub/kept.rs", ""),
+            ("other/local.rs", ""),
+            // A worktree or nested repository inside the root is not entered.
+            ("nested/n.rs", ""),
+        ];
+        for (path, text) in files {
+            fs::write(root.join(path), text).unwrap();
+        }
+        let listed = |from: &Path| {
+            let scan = files_under(from);
+            assert!(scan.ignores_applied && !scan.incomplete);
+            let mut names: Vec<String> =
+                scan.files.iter().map(|f| f.strip_prefix(from).unwrap().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            listed(&root),
+            [
+                ".gitignore",
+                "keep.log",
+                "kept.tmp",
+                "other/local.rs",
+                "src/build-out/y.rs",
+                "sub/.gitignore",
+                "sub/kept.rs",
+                "x.py"
+            ]
+        );
+        // Rules written above the root still apply, anchored ones included.
+        assert_eq!(listed(&root.join("sub")), [".gitignore", "kept.rs"]);
+        fs::remove_dir_all(root.join(".git")).unwrap();
+        let plain = files_under(&root);
+        assert!(!plain.ignores_applied && plain.files.len() == files.len() - 1);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn file_and_count_modes_list_names_and_totals() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rusty-query-modes-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("rg-fixture");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+case " $* " in *" --max-count "*) exit 64;; esac
+case " $* " in
+  *" --files-with-matches "*) printf 'b.rs\000a.rs\000' ;;
+  *" --count-matches "*) printf 'z.rs\0003\na.rs\0002\n' ;;
+  *) exit 65 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let program = script.to_str().unwrap();
+        let files = search_with(program, "needle", ".", None, 0, Mode::Files, &|| false);
+        let counts = search_with(program, "needle", ".", None, 0, Mode::Count, &|| false);
+        fs::remove_dir_all(dir).unwrap();
+        let files = files.unwrap();
+        // Neither name exists here, so both lack a time and fall back to name order.
+        assert_eq!(files.output.text, "a.rs\nb.rs\n");
+        assert!(files.scan_complete && files.render().contains("most recently modified first"));
+        let counts = counts.unwrap();
+        assert_eq!(counts.output.text, "a.rs:2\nz.rs:3\n5 matches in 2 files\n");
+        assert!(counts.scan_complete);
+    }
+
+    #[test]
+    fn matching_files_come_newest_first_and_a_cut_name_is_dropped() {
+        let dir = std::env::temp_dir().join(format!("rusty-query-newest-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (old, new) = (dir.join("old.rs"), dir.join("new.rs"));
+        for (path, age) in [(&old, 3600), (&new, 60)] {
+            let file = fs::File::create(path).unwrap();
+            file.set_modified(std::time::SystemTime::now() - Duration::from_secs(age)).unwrap();
+        }
+        let raw = format!("{}\0{}\0{}/cut", old.display(), new.display(), dir.display());
+        let shown = present_files(Capture { text: raw, truncated: true }, '\0');
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(shown.text, format!("{}\n{}\n", new.display(), old.display()));
+        assert!(shown.truncated);
+        let counts = present_counts(Capture { text: "a.rs:0\nb.rs:1\n".into(), truncated: false }, ':', true);
+        assert_eq!(counts.text, "b.rs:1\n1 matching line in 1 file\n");
+        // A cut-off capture says its total is partial, and drops the cut row.
+        let cut = present_counts(Capture { text: "a.rs\x002\nb.rs\x003\nc.r".into(), truncated: true }, '\0', false);
+        assert_eq!(cut.text, "a.rs:2\nb.rs:3\npartial total: 5 matches in the 2 files shown\n");
+    }
+
+    #[test]
+    fn output_modes_parse_by_name() {
+        assert!(Mode::parse(None).is_ok_and(|m| m == Mode::Content));
+        assert!(Mode::parse(Some("files_with_matches")).is_ok_and(|m| m == Mode::Files));
+        assert!(Mode::parse(Some("lines")).is_err());
+    }
+
+    #[test]
+    fn fallback_in_a_repository_uses_git_grep_and_leaves_ignored_files_out() {
+        if Command::new("git").arg("--version").output().is_err()
+            || repo_root(&std::env::current_dir().unwrap()).is_none()
+        {
+            return;
+        }
+        // target/ is ignored by the repository's .gitignore.
+        let token = format!("ignoredprobe{}", std::process::id());
+        // An untracked file with a name git would otherwise quote.
+        let odd = PathBuf::from("tests").join(format!("caf\u{e9}-probe-{}.txt", std::process::id()));
+        fs::write(&odd, format!("named{token}")).unwrap();
+        let named =
+            search_with("/rusty/nonexistent-rg", &format!("named{token}"), "tests", None, 0, Mode::Files, &|| false);
+        let line =
+            search_with("/rusty/nonexistent-rg", &format!("named{token}"), "tests", None, 0, Mode::Content, &|| false);
+        fs::remove_file(&odd).unwrap();
+        assert_eq!(named.unwrap().output.text, format!("{}\n", odd.display()));
+        assert_eq!(line.unwrap().output.text, format!("{}:1:named{token}\n", odd.display()));
+        let dir = PathBuf::from("target").join(format!("rusty-fallback-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("probe.rs"), &token).unwrap();
+        let hidden = search_with("/rusty/nonexistent-rg", &token, ".", None, 0, Mode::Files, &|| false).unwrap();
+        let shown = search_with("/rusty/nonexistent-rg", "fn search_with", "src", None, 0, Mode::Files, &|| false);
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(hidden.engine, "git-grep");
+        assert!(hidden.output.text.is_empty(), "{}", hidden.output.text);
+        let shown = shown.unwrap();
+        assert_eq!(shown.output.text, "src/workspace_query.rs\n");
+        assert!(!shown.scan_complete && shown.render().contains(".gitignore applied"));
+    }
+
+    #[test]
+    fn wildcard_classes_match_as_git_does() {
+        assert!(wildcard(b"*.py[cod]", b"x.pyc") && !wildcard(b"*.py[cod]", b"x.py"));
+        assert!(wildcard(b"[Bb]in", b"bin") && wildcard(b"[Bb]in", b"Bin") && !wildcard(b"[Bb]in", b"pin"));
+        assert!(wildcard(b"*.[a-c]", b"x.b") && !wildcard(b"*.[a-c]", b"x.d"));
+        assert!(wildcard(b"[!a]x", b"bx") && wildcard(b"[^a]x", b"bx") && !wildcard(b"[!a]x", b"ax"));
+        assert!(wildcard(b"[]]", b"]") && !wildcard(b"a[/]b", b"a/b"));
+        assert!(wildcard(b"a[b", b"a[b"), "a class that never closes is literal");
+    }
+
+    #[test]
+    fn git_grep_pathspecs_follow_the_path_and_glob() {
+        assert_eq!(pathspecs(".", None), ["."]);
+        assert_eq!(pathspecs(".", Some("*.rs")), [":(glob)**/*.rs"]);
+        assert_eq!(pathspecs("src/", Some("src/**/*.rs")), [":(glob)src/src/**/*.rs"]);
+        assert_eq!(pathspecs(".", Some("*.{rs,py}")), [":(glob)**/*.rs", ":(glob)**/*.py"]);
+        assert_eq!(pathspecs("src", Some("!*.md")), ["src", ":(glob,exclude)src/**/*.md"]);
     }
 }
